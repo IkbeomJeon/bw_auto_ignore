@@ -275,7 +275,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 }
 
-// 후크 시작/중지 함수
 void StartKeyboardHook()
 {
     if (g_hHook == NULL)
@@ -321,6 +320,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     StartKeyboardHook();
+
+    //프로그램 실행 메세지 출력
+	MessageBox(NULL, L"bw_auto_ignore 프로그램이 실행되었습니다. 시계 옆 시스템 트레이를 확인하세요 .", L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
+
     // 메시지 루프
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
@@ -338,6 +341,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // 뮤텍스 해제
     if (hMutex)
         CloseHandle(hMutex);
+
+	
 
     return (int)msg.wParam;
 }
@@ -412,7 +417,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == 1002) // Help
         {
             MessageBox(hWnd,
-                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제",
+                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제\n\n Contact: jeonikbeom@gmail.com",
                 L"Help", MB_OK | MB_ICONINFORMATION);
         }
         else if (LOWORD(wParam) == 1003) // Exit

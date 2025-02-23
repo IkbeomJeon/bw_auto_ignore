@@ -1,46 +1,30 @@
-# Project Title
-One to two paragraph statement about your project and what it does.
+# Starcraft Auto Ignore
 
-## Prerequisites
+StarCraft에서 `/ignore <id>` 명령어를 간편하게 **F9 키** 입력으로 대체하는 도구입니다.
 
-Before you begin, ensure you have met the following requirements:
-- You need to have Node.js and npm installed.
+## 기능
 
-## Installing <Project_Name>
+- **F9**: 현재 대전 중인 사용자의 채팅을 차단 (`/ignore <id>` 자동 입력)
+- **F8**: 최근 차단한 사용자의 채팅 차단을 해제 (`/unignore <id>` 자동 입력)
 
-To install <Project_Name>, follow these steps:
+## 사용법
 
-Linux and macOS:
-``` bash
-<install_command>
-```
+StarCraft 게임이 시작된 후:
 
-## Uses
-To use <Project_Name>, follow these steps:
-```
-<usage_example>
-```
+- **F9 입력**: 현재 대전 중인 상대방의 채팅을 차단합니다.
 
-## Contributing to <Project_Name>
-To contribute to <Project_Name>, follow these steps:
+- **F8 입력**: 가장 최근에 차단한 상대방의 채팅 차단을 해제합니다.
 
-1. Fork this repository.
-2. Create a branch: `git checkout -b <branch_name>`.
-3. Make your changes and commit them: `git commit -m '<commit_message>'`
-4. Push to the original branch: `git push origin <Project_Name>/<location>`
-5. Create the pull request.
+## 설치
 
-Alternatively, see the GitHub documentation on [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
+[Download](https://drive.google.com/file/d/1VVFvlN1iqZuUiN95I3w5od42bZdEnh55/view?usp=drive_link)
 
-## Contributors
-
-Thanks to the following people who have contributed to this project:
-- [@contributor1](https://github.com/contributor1)
-- [@contributor2](https://github.com/contributor1)
+또는, Visual Studio 2022에서 프로젝트 빌드
 
 ## Contact
-If you want to contact me you can reach me at <ikbeomjeon@gmail.com>.
+
+📧 **jeonikbeom@gmail.com**
 
 ## License
 
-This project uses the following license: [<license_name>](link).
+이 프로젝트는 [MIT License](https://opensource.org/licenses/MIT) 하에 배포됩니다.
