@@ -16,6 +16,7 @@
 #include <mutex>
 #include <iterator>
 #include <map>
+#include "resource.h"
 
 // 전역 변수
 DWORD g_starcraftPID = 0;
@@ -305,7 +306,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     g_starcraftPID = GetProcessID(processName);
     if (g_starcraftPID == 0)
     {
-        std::wcout << L"StarCraft 프로세스를 찾을 수 없습니다.\n";
+        std::wcout << L"StarCraft를 먼저 실행해 주세요.\n";
+		//메시지 박스 추가
+		MessageBox(NULL, L"StarCraft를 먼저 실행해 주세요.", L"Error", MB_OK | MB_ICONERROR);
+		return 0;
     }
     else
     {
@@ -314,6 +318,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         if (g_hProcess == NULL)
         {
             std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
+            MessageBox(NULL, L"StarCraft 프로세스를 찾을 수 없습니다.", L"Error", MB_OK | MB_ICONERROR);
+			return 0;
+
         }
     }
 
@@ -352,13 +359,14 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.style = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
-    // 아이콘 로드는 필요 시 LoadImage로 수정할 수 있습니다.
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPLICATION));
+    
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszMenuName = NULL;
     wcex.lpszClassName = szWindowClass;
-    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_APPLICATION));
+
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
+    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
 
     return RegisterClassExW(&wcex);
 }
@@ -383,7 +391,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP + 1;
-    nid.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPLICATION));
+    nid.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
     wcscpy_s(nid.szTip, L"bw_auto_ignore");
     Shell_NotifyIcon(NIM_ADD, &nid);
 
