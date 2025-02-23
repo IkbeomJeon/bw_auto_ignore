@@ -15,6 +15,7 @@
 #include <chrono>
 #include <mutex>
 #include <iterator>
+#include <map>
 
 // 전역 변수
 DWORD g_starcraftPID = 0;
@@ -148,55 +149,68 @@ void SendToStarCraft(std::string command)
     SendVirtualKey(VK_RETURN);
 }
 
-void DoExtraction()
-{
+// DoExtraction 함수 수정
+void DoExtraction() {
     const char targetPrefix[] = u8"/aurora-profile-by-toon/";
     size_t prefixLen = strlen(targetPrefix);
-    const char tailChar = '/';
+    const char tailChar = '/'; // 다음 '/'를 찾음
 
     std::vector<ULONGLONG> addresses = FindAllPrefixAddresses(g_hProcess, targetPrefix);
-    int newCount = 0;
-    for (ULONGLONG addr : addresses)
-    {
+    if (addresses.empty()) {
+        std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
+        return;
+    }
+
+    std::map<std::string, int> frequencyMap;
+    std::vector<std::string> extractedList;
+
+    for (ULONGLONG addr : addresses) {
         std::string fullStr = ReadNullTerminatedString(g_hProcess, addr);
-        if (fullStr.compare(0, prefixLen, targetPrefix) == 0)
-        {
+        if (fullStr.compare(0, prefixLen, targetPrefix) == 0) {
             size_t endPos = fullStr.find(tailChar, prefixLen);
-            if (endPos != std::string::npos && endPos > prefixLen)
-            {
+            if (endPos != std::string::npos && endPos > prefixLen) {
                 std::string extracted = fullStr.substr(prefixLen, endPos - prefixLen);
-                if (!extracted.empty())
-                {
-                    std::lock_guard<std::mutex> lock(g_mutex);
-                    if (g_extractedSet.find(extracted) == g_extractedSet.end())
-                    {
-                        g_extractedSet.insert(extracted);
-                        g_extractedOrder.push_back(extracted);
-                        int size_needed = MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, NULL, 0);
-                        std::wstring wextracted(size_needed, 0);
-                        MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, &wextracted[0], size_needed);
-                        std::wcout << L"주소: 0x" << std::hex << addr
-                            << L", 추출 값: " << wextracted << L"  -> 추가되었습니다" << std::endl;
-                        newCount++;
-                        SendToStarCraft("/ignore " + extracted);
-                    }
+                if (!extracted.empty()) {
+                    frequencyMap[extracted]++;
+                    extractedList.push_back(extracted);
                 }
             }
         }
     }
-    if (newCount == 0)
-    {
+
+    if (extractedList.size() <= 1) {
+        std::wcout << L"추출된 문자열이 하나뿐이므로 추가하지 않습니다.\n";
+        return;
+    }
+
+    int newCount = 0;
+    for (const std::string& extracted : extractedList) {
+        if (frequencyMap[extracted] == 1) { // 유일하게 한 번만 나타난 경우
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_extractedSet.find(extracted) == g_extractedSet.end()) {
+                g_extractedSet.insert(extracted);
+                g_extractedOrder.push_back(extracted);
+                int size_needed = MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, NULL, 0);
+                std::wstring wextracted(size_needed, 0);
+                MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, &wextracted[0], size_needed);
+                std::wcout << L"추출 값: " << wextracted << L"  -> 추가되었습니다" << std::endl;
+                newCount++;
+                SendToStarCraft("/ignore " + extracted);
+            }
+        }
+    }
+
+    if (newCount == 0) {
         std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
     }
 }
 
-void DoRemoval()
-{
+// DoRemoval 함수 수정
+void DoRemoval() {
     std::string removedId;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_extractedOrder.empty())
-        {
+        if (g_extractedOrder.empty()) {
             std::wcout << L"제거할 id가 없습니다.\n";
             return;
         }
