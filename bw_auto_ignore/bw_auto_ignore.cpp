@@ -150,7 +150,6 @@ void SendToStarCraft(std::string command)
     SendVirtualKey(VK_RETURN);
 }
 
-// DoExtraction 함수 수정
 void DoExtraction() {
     const char targetPrefix[] = u8"/aurora-profile-by-toon/";
     size_t prefixLen = strlen(targetPrefix);
@@ -161,8 +160,6 @@ void DoExtraction() {
         std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
         return;
     }
-
-    //std::map<std::string, int> frequencyMap;
     std::vector<std::string> extractedList;
 
     for (ULONGLONG addr : addresses) {
@@ -172,7 +169,6 @@ void DoExtraction() {
             if (endPos != std::string::npos && endPos > prefixLen) {
                 std::string extracted = fullStr.substr(prefixLen, endPos - prefixLen);
                 if (!extracted.empty()) {
-                    //frequencyMap[extracted]++;
                     extractedList.push_back(extracted);
                 }
             }
@@ -183,12 +179,17 @@ void DoExtraction() {
         std::wcout << L"추출된 문자열이 하나뿐이므로 추가하지 않습니다.\n";
         return;
     }
+    std::string string_to_ignore = "\"+encodeURIComponent(r.data.name)+\"";
+   
+	//extractedList에서 string_to_ignore를 제외하기
+	extractedList.erase(std::remove(extractedList.begin(), extractedList.end(), string_to_ignore), extractedList.end());
 
     std::string myId = extractedList[0];
 
     int newCount = 0;
+    
     for (const std::string& extracted : extractedList) {
-		if (extracted != myId) {
+		if (extracted != myId && extracted != string_to_ignore) {
             std::lock_guard<std::mutex> lock(g_mutex);
             if (g_extractedSet.find(extracted) == g_extractedSet.end()) {
                 g_extractedSet.insert(extracted);
@@ -208,7 +209,6 @@ void DoExtraction() {
     }
 }
 
-// DoRemoval 함수 수정
 void DoRemoval() {
     std::string removedId;
     {
@@ -237,7 +237,26 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         DWORD foregroundPID = 0;
         GetWindowThreadProcessId(hForeground, &foregroundPID);
         if (pKbd->vkCode == VK_F9)
-        {
+        {    
+            // StarCraft 프로세스 찾기 및 프로세스 핸들 열기
+            const wchar_t* processName = L"StarCraft.exe";
+            DWORD g_starcraftPID_new = GetProcessID(processName);
+
+			// StarCraft 프로세스ID가 변경되었을 때 핸들을 다시 열기
+            if (g_starcraftPID_new!=0 && g_starcraftPID != g_starcraftPID_new)
+            {
+				g_starcraftPID = g_starcraftPID_new;
+				if (g_hProcess)
+					CloseHandle(g_hProcess);
+				
+                g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
+				if (g_hProcess == NULL)
+				{
+					std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
+					return 0;
+				}
+            }
+            
             if (foregroundPID == g_starcraftPID)
             {
                 std::thread extractionThread(DoExtraction);
@@ -301,35 +320,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return FALSE;
     }
 
-    // StarCraft 프로세스 찾기 및 프로세스 핸들 열기
-    const wchar_t* processName = L"StarCraft.exe";
-    g_starcraftPID = GetProcessID(processName);
-    if (g_starcraftPID == 0)
-    {
-        std::wcout << L"StarCraft를 먼저 실행해 주세요.\n";
-		//메시지 박스 추가
-		MessageBox(NULL, L"StarCraft를 먼저 실행해 주세요.", L"Error", MB_OK | MB_ICONERROR);
-		return 0;
-    }
-    else
-    {
-        std::wcout << L"StarCraft PID: " << g_starcraftPID << std::endl;
-        g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
-        if (g_hProcess == NULL)
-        {
-            std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
-            MessageBox(NULL, L"StarCraft 프로세스를 찾을 수 없습니다.", L"Error", MB_OK | MB_ICONERROR);
-			return 0;
-
-        }
-    }
-
-    // 항상 활성 상태이므로 후크 설치 (g_enabled 관련 토글 제거)
-    if (g_hProcess)
-    {
-        StartKeyboardHook();
-    }
-
+    StartKeyboardHook();
     // 메시지 루프
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
@@ -421,7 +412,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == 1002) // Help
         {
             MessageBox(hWnd,
-                L"F9 : 사용자 무시 \nF8 : 사용자 무시 해제",
+                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제",
                 L"Help", MB_OK | MB_ICONINFORMATION);
         }
         else if (LOWORD(wParam) == 1003) // Exit
