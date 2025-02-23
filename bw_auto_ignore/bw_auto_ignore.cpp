@@ -138,13 +138,13 @@ void SendToStarCraft(std::string command)
 {
     // 먼저 엔터 전송
     SendVirtualKey(VK_RETURN);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, NULL, 0);
     std::wstring wcommand(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, &wcommand[0], size_needed);
     SendUnicodeString(wcommand);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     // 마지막으로 엔터 전송
     SendVirtualKey(VK_RETURN);
 }
@@ -161,7 +161,7 @@ void DoExtraction() {
         return;
     }
 
-    std::map<std::string, int> frequencyMap;
+    //std::map<std::string, int> frequencyMap;
     std::vector<std::string> extractedList;
 
     for (ULONGLONG addr : addresses) {
@@ -171,7 +171,7 @@ void DoExtraction() {
             if (endPos != std::string::npos && endPos > prefixLen) {
                 std::string extracted = fullStr.substr(prefixLen, endPos - prefixLen);
                 if (!extracted.empty()) {
-                    frequencyMap[extracted]++;
+                    //frequencyMap[extracted]++;
                     extractedList.push_back(extracted);
                 }
             }
@@ -183,9 +183,11 @@ void DoExtraction() {
         return;
     }
 
+    std::string myId = extractedList[0];
+
     int newCount = 0;
     for (const std::string& extracted : extractedList) {
-        if (frequencyMap[extracted] == 1) { // 유일하게 한 번만 나타난 경우
+		if (extracted != myId) {
             std::lock_guard<std::mutex> lock(g_mutex);
             if (g_extractedSet.find(extracted) == g_extractedSet.end()) {
                 g_extractedSet.insert(extracted);
