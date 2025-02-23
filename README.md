@@ -19,7 +19,7 @@ StarCraft 게임이 시작된 후:
 
 [Download](https://drive.google.com/file/d/1VVFvlN1iqZuUiN95I3w5od42bZdEnh55/view?usp=drive_link)
 
-또는, Visual Studio 2022에서 프로젝트 빌드
+또는, Visual Studio 2022, x64에서 빌드
 
 ## Contact
 
