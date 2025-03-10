@@ -23,7 +23,7 @@
 // ---------------------------------------------------------------------------
 int KEY_IGNORE = VK_F9;
 int KEY_UNIGNORE = VK_F8;
-int KEY_ADDITIONAL_CTRL = VK_KANA;
+int KEY_ADDITIONAL_CTRL = VK_APPS;
 
 DWORD g_starcraftPID = 0;
 HANDLE g_hProcess = NULL;
@@ -326,7 +326,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 }
             }
 
-            // 키 리매핑: StarCraft 창에서만, g_swapSpaceAndControl 활성 시 VK_KANA를 VK_CONTROL로 대체
+            
+            // 키 리매핑: StarCraft 창에서만, g_swapSpaceAndControl 활성 시 VK_KANA를 VK_CONTROL로 대체            
             if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
             {
                 input.ki.wVk = VK_CONTROL;
