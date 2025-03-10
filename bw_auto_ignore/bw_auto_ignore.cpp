@@ -35,10 +35,40 @@ ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+DWORD GetProcessID(const wchar_t* processName);
 
 // 전역 변수 추가
 bool g_swapSpaceAndControl = true; // 체크박스 설정에 따라 키 리매핑 여부 결정
 
+// 전역 변수: 마지막 업데이트 시각 (예: std::chrono::steady_clock)
+std::chrono::steady_clock::time_point g_lastUpdate = std::chrono::steady_clock::now();
+
+void UpdateStarCraftProcess()
+{
+    const wchar_t* processName = L"StarCraft.exe";
+    DWORD newPID = GetProcessID(processName);
+    if (newPID != 0 && g_starcraftPID != newPID)
+    {
+        g_starcraftPID = newPID;
+        if (g_hProcess)
+            CloseHandle(g_hProcess);
+        g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
+        if (g_hProcess == NULL)
+        {
+            std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
+        }
+    }
+}
+
+// 별도 모니터링 스레드 함수
+void ProcessMonitorThread()
+{
+    while (true)
+    {
+        UpdateStarCraftProcess();
+        std::this_thread::sleep_for(std::chrono::seconds(3)); // 3초마다 업데이트
+    }
+}
 DWORD GetProcessID(const wchar_t* processName)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -307,22 +337,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         DWORD foregroundPID = 0;
         GetWindowThreadProcessId(hForeground, &foregroundPID);
 
-        const wchar_t* processName = L"StarCraft.exe";
-        DWORD g_starcraftPID_new = GetProcessID(processName);
-
-        if (g_starcraftPID_new != 0 && g_starcraftPID != g_starcraftPID_new)
-        {
-            g_starcraftPID = g_starcraftPID_new;
-            if (g_hProcess)
-                CloseHandle(g_hProcess);
-            g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
-            if (g_hProcess == NULL)
-            {
-                std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
-                return 0;
-            }
-        }
-
         // 기존 F9, F8 처리 (StarCraft 자동 무시/무시 해제)
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
@@ -460,6 +474,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     StartKeyboardHook();
+
+    // ProcessMonitorThread를 별도의 스레드에서 실행
+    std::thread monitorThread(ProcessMonitorThread);
+    monitorThread.detach(); // 백그라운드 스레드로 실행
 
     //프로그램 실행 메세지 출력
     MessageBox(NULL, L"bw_auto_ignore 프로그램이 실행되었습니다. 시계 옆 시스템 트레이를 확인하세요 .", L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
