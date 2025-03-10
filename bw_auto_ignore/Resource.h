@@ -13,6 +13,10 @@
 #define IDI_SMALL				108
 #define IDC_BWAUTOIGNORE			109
 #define IDC_MYICON				2
+
+#define IDD_SETTING_DIALOG         101
+#define IDC_SWAP_KEY               1004
+
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif

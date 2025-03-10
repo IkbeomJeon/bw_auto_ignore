@@ -34,9 +34,10 @@ NOTIFYICONDATA nid = { 0 };           // 시스템 트레이 아이콘 데이터
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-//---------------------------------------------------------------------------
-// 기존 기능: StarCraft 프로세스 탐색, 메모리 스캔, 문자열 추출/제거, 키보드 후크
+// 전역 변수 추가
+bool g_swapSpaceAndControl = true; // 체크박스 설정에 따라 키 리매핑 여부 결정
 
 DWORD GetProcessID(const wchar_t* processName)
 {
@@ -228,52 +229,6 @@ void DoRemoval() {
     SendToStarCraft("/unignore " + removedId);
 }
 
-LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
-    {
-        KBDLLHOOKSTRUCT* pKbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-        HWND hForeground = GetForegroundWindow();
-        DWORD foregroundPID = 0;
-        GetWindowThreadProcessId(hForeground, &foregroundPID);
-        if (pKbd->vkCode == VK_F9)
-        {    
-            // StarCraft 프로세스 찾기 및 프로세스 핸들 열기
-            const wchar_t* processName = L"StarCraft.exe";
-            DWORD g_starcraftPID_new = GetProcessID(processName);
-
-			// StarCraft 프로세스ID가 변경되었을 때 핸들을 다시 열기
-            if (g_starcraftPID_new!=0 && g_starcraftPID != g_starcraftPID_new)
-            {
-				g_starcraftPID = g_starcraftPID_new;
-				if (g_hProcess)
-					CloseHandle(g_hProcess);
-				
-                g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
-				if (g_hProcess == NULL)
-				{
-					std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
-					return 0;
-				}
-            }
-            
-            if (foregroundPID == g_starcraftPID)
-            {
-                std::thread extractionThread(DoExtraction);
-                extractionThread.detach();
-            }
-        }
-        else if (pKbd->vkCode == VK_F8)
-        {
-            if (foregroundPID == g_starcraftPID)
-            {
-                std::thread removalThread(DoRemoval);
-                removalThread.detach();
-            }
-        }
-    }
-    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
-}
 
 void StartKeyboardHook()
 {
@@ -290,62 +245,6 @@ void StopKeyboardHook()
     }
 }
 
-//---------------------------------------------------------------------------
-// Win32 GUI 애플리케이션 부분
-
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR    lpCmdLine,
-    _In_ int       nCmdShow)
-{
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
-
-    // 중복 실행 방지: 고유 이름의 뮤텍스 생성
-    HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\bw_auto_ignoreMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        // 이미 실행 중이면 종료
-        return 0;
-    }
-
-    // 콘솔 입출력 모드 설정 (디버깅용)
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    setlocale(LC_ALL, "");
-
-    MyRegisterClass(hInstance);
-    if (!InitInstance(hInstance, nCmdShow))
-    {
-        return FALSE;
-    }
-
-    StartKeyboardHook();
-
-    //프로그램 실행 메세지 출력
-	MessageBox(NULL, L"bw_auto_ignore 프로그램이 실행되었습니다. 시계 옆 시스템 트레이를 확인하세요 .", L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
-
-    // 메시지 루프
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    // 종료 시 후크 제거 및 프로세스 핸들 닫기, 트레이 아이콘 제거
-    StopKeyboardHook();
-    if (g_hProcess)
-        CloseHandle(g_hProcess);
-    Shell_NotifyIcon(NIM_DELETE, &nid);
-
-    // 뮤텍스 해제
-    if (hMutex)
-        CloseHandle(hMutex);
-
-	
-
-    return (int)msg.wParam;
-}
 
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
@@ -394,6 +293,103 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     return TRUE;
 }
 
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if (nCode == HC_ACTION)
+    {
+        KBDLLHOOKSTRUCT* pKbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        bool blockEvent = false;
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+
+        // 먼저 포그라운드 창의 프로세스 ID 확인
+        HWND hForeground = GetForegroundWindow();
+        DWORD foregroundPID = 0;
+        GetWindowThreadProcessId(hForeground, &foregroundPID);
+
+        const wchar_t* processName = L"StarCraft.exe";
+        DWORD g_starcraftPID_new = GetProcessID(processName);
+
+        if (g_starcraftPID_new != 0 && g_starcraftPID != g_starcraftPID_new)
+        {
+            g_starcraftPID = g_starcraftPID_new;
+            if (g_hProcess)
+                CloseHandle(g_hProcess);
+            g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
+            if (g_hProcess == NULL)
+            {
+                std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
+                return 0;
+            }
+        }
+
+        // 기존 F9, F8 처리 (StarCraft 자동 무시/무시 해제)
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+        {
+            if (foregroundPID == g_starcraftPID && pKbd->vkCode == VK_F9)
+            {
+                std::thread extractionThread(DoExtraction);
+                extractionThread.detach();
+            }
+            else if (foregroundPID == g_starcraftPID && pKbd->vkCode == VK_F8)
+            {
+                std::thread removalThread(DoRemoval);
+                removalThread.detach();
+            }
+
+            if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && pKbd->vkCode == VK_KANA)
+            {
+                // 스페이스바 대신 컨트롤키 다운 전송
+                input.ki.wVk = VK_CONTROL;
+                input.ki.dwFlags = 0; // key down
+                SendInput(1, &input, sizeof(INPUT));
+                blockEvent = true;
+            }
+        }
+		if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
+		{
+			if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && pKbd->vkCode == VK_KANA)
+			{
+				// 스페이스바 해제 대신 컨트롤키 해제 전송
+				input.ki.wVk = VK_CONTROL;
+				input.ki.dwFlags = KEYEVENTF_KEYUP;
+				SendInput(1, &input, sizeof(INPUT));
+				blockEvent = true;
+			}
+		}
+        if (blockEvent)
+            return 1; // 원래 이벤트 차단
+    }
+    return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+}
+
+
+INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        // 현재 플래그 값에 따라 체크박스 상태를 설정
+        CheckDlgButton(hDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
+        return (INT_PTR)TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            // 체크박스 상태를 확인하여 플래그 업데이트
+            g_swapSpaceAndControl = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        else if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -404,9 +400,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
-            // Help 메뉴 항목 추가
             AppendMenu(hMenu, MF_STRING, 1002, L"Help");
-            // Exit 메뉴 항목 추가
+            AppendMenu(hMenu, MF_STRING, 1004, L"Setting");
             AppendMenu(hMenu, MF_STRING, 1003, L"Exit");
             SetForegroundWindow(hWnd);
             TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
@@ -417,12 +412,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (LOWORD(wParam) == 1002) // Help
         {
             MessageBox(hWnd,
-                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제\n\n Contact: jeonikbeom@gmail.com",
+                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제\n\n",
                 L"Help", MB_OK | MB_ICONINFORMATION);
         }
         else if (LOWORD(wParam) == 1003) // Exit
         {
             DestroyWindow(hWnd);
+        }
+        else if (LOWORD(wParam) == 1004) // Setting 메뉴 선택 시
+        {
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWnd, SettingDlgProc);
         }
         break;
     case WM_DESTROY:
@@ -432,4 +431,58 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
+}
+
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPWSTR    lpCmdLine,
+    _In_ int       nCmdShow)
+{
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+
+    // 중복 실행 방지: 고유 이름의 뮤텍스 생성
+    HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\bw_auto_ignoreMutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        // 이미 실행 중이면 종료
+        return 0;
+    }
+
+    // 콘솔 입출력 모드 설정 (디버깅용)
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    setlocale(LC_ALL, "");
+
+    MyRegisterClass(hInstance);
+    if (!InitInstance(hInstance, nCmdShow))
+    {
+        return FALSE;
+    }
+
+    StartKeyboardHook();
+
+    //프로그램 실행 메세지 출력
+    MessageBox(NULL, L"bw_auto_ignore 프로그램이 실행되었습니다. 시계 옆 시스템 트레이를 확인하세요 .", L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
+
+    // 메시지 루프
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    // 종료 시 후크 제거 및 프로세스 핸들 닫기, 트레이 아이콘 제거
+    StopKeyboardHook();
+    if (g_hProcess)
+        CloseHandle(g_hProcess);
+    Shell_NotifyIcon(NIM_DELETE, &nid);
+
+    // 뮤텍스 해제
+    if (hMutex)
+        CloseHandle(hMutex);
+
+
+
+    return (int)msg.wParam;
 }
