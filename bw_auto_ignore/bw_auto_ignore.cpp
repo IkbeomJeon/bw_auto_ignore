@@ -23,8 +23,11 @@
 // ---------------------------------------------------------------------------
 int KEY_IGNORE = VK_F9;
 int KEY_UNIGNORE = VK_F8;
-int KEY_ADDITIONAL_CTRL = VK_APPS;
+//int KEY_ADDITIONAL_CTRL = VK_APPS;
+int KEY_ADDITIONAL_CTRL = VK_SPACE;
+int KEY_SWAP_CTRL = VK_F12;
 
+HWND g_hSettingDlg = NULL;
 DWORD g_starcraftPID = 0;
 HANDLE g_hProcess = NULL;
 std::set<std::string> g_extractedSet;
@@ -309,7 +312,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         DWORD foregroundPID = 0;
         GetWindowThreadProcessId(hForeground, &foregroundPID);
 
-        // 처리: F9, F8 키로 추출/제거 실행
+        // StarCraft 창에서 F9와 F8 키로 추출/제거 실행
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
             if (foregroundPID == g_starcraftPID)
@@ -319,15 +322,28 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                     std::thread extractionThread(DoExtraction);
                     extractionThread.detach();
                 }
-                else if (pKbd->vkCode == KEY_UNIGNORE)
+                if (pKbd->vkCode == KEY_UNIGNORE)
                 {
                     std::thread removalThread(DoRemoval);
                     removalThread.detach();
                 }
+                if(pKbd->vkCode == KEY_SWAP_CTRL)
+                {
+                    g_swapSpaceAndControl = !g_swapSpaceAndControl;
+                    std::wcout << L"Spacebar to Control swap "
+                        << (g_swapSpaceAndControl ? L"enabled" : L"disabled")
+                        << std::endl;
+                    // 설정 대화상자가 열려 있다면 체크박스 상태 업데이트
+                    if (g_hSettingDlg)
+                    {
+                        CheckDlgButton(g_hSettingDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
+                    }
+                    return 1; // F12 키 이벤트 차단
+                }
             }
 
-            
-            // 키 리매핑: StarCraft 창에서만, g_swapSpaceAndControl 활성 시 VK_KANA를 VK_CONTROL로 대체            
+            // StarCraft 창에서만, g_swapSpaceAndControl이 활성화된 경우
+            // 스페이스바(KEY_ADDITIONAL_CTRL)를 컨트롤키로 리매핑
             if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
             {
                 input.ki.wVk = VK_CONTROL;
@@ -352,11 +368,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 }
 
+
 INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
     case WM_INITDIALOG:
+        // 대화상자 핸들을 저장
+        g_hSettingDlg = hDlg;
         // 기존 체크박스 상태 설정 (예: IDC_SWAP_KEY)
         CheckDlgButton(hDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
@@ -366,17 +385,20 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
             // 체크박스 상태에 따라 g_swapSpaceAndControl 업데이트
             g_swapSpaceAndControl = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
             EndDialog(hDlg, IDOK);
+            g_hSettingDlg = NULL;
             return (INT_PTR)TRUE;
         }
         else if (LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, IDCANCEL);
+            g_hSettingDlg = NULL;
             return (INT_PTR)TRUE;
         }
         break;
     }
     return (INT_PTR)FALSE;
 }
+
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
