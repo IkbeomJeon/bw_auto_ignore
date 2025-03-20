@@ -374,8 +374,6 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
     switch (message)
     {
     case WM_INITDIALOG:
-        // 대화상자 핸들을 저장
-        g_hSettingDlg = hDlg;
         // 기존 체크박스 상태 설정 (예: IDC_SWAP_KEY)
         CheckDlgButton(hDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
@@ -385,20 +383,17 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
             // 체크박스 상태에 따라 g_swapSpaceAndControl 업데이트
             g_swapSpaceAndControl = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
             EndDialog(hDlg, IDOK);
-            g_hSettingDlg = NULL;
             return (INT_PTR)TRUE;
         }
         else if (LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, IDCANCEL);
-            g_hSettingDlg = NULL;
             return (INT_PTR)TRUE;
         }
         break;
     }
     return (INT_PTR)FALSE;
 }
-
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
