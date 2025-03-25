@@ -31,7 +31,6 @@ HWND g_hSettingDlg = NULL;
 DWORD g_starcraftPID = 0;
 HANDLE g_hProcess = NULL;
 std::set<std::string> g_extractedSet;
-std::vector<std::string> g_extractedOrder; // 삽입 순서 관리
 std::mutex g_mutex;
 HHOOK g_hHook = NULL;
 HINSTANCE hInst;                    // 현재 인스턴스
@@ -181,53 +180,71 @@ void SendToStarCraft(std::string command)
     SendVirtualKey(VK_RETURN);
 }
 
-void DoExtraction() {
-    const char targetPrefix[] = u8"/aurora-profile-by-toon/";
-    size_t prefixLen = strlen(targetPrefix);
-    const char tailChar = '/';
-
+std::set<std::string> ExtractStrings(const char* targetPrefix, size_t prefixLen, char tailChar = '\0')
+{
     std::vector<ULONGLONG> addresses = FindAllPrefixAddresses(g_hProcess, targetPrefix);
+
     if (addresses.empty()) {
         std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
-        return;
+        return {};
     }
-    std::vector<std::string> extractedList;
+    std::set<std::string> extractedIDSet;
 
     for (ULONGLONG addr : addresses) {
         std::string fullStr = ReadNullTerminatedString(g_hProcess, addr);
         if (fullStr.compare(0, prefixLen, targetPrefix) == 0) {
-            size_t endPos = fullStr.find(tailChar, prefixLen);
-            if (endPos != std::string::npos && endPos > prefixLen) {
-                std::string extracted = fullStr.substr(prefixLen, endPos - prefixLen);
-                if (!extracted.empty()) {
-                    extractedList.push_back(extracted);
+            std::string extracted;
+            if (tailChar == '\0') {
+                // tailChar이 전달되지 않은 경우, 접두어 이후 전체 문자열(즉, null까지)을 추출
+                extracted = fullStr.substr(prefixLen);
+            }
+            else {
+                size_t endPos = fullStr.find(tailChar, prefixLen);
+                if (endPos != std::string::npos && endPos > prefixLen) {
+                    extracted = fullStr.substr(prefixLen, endPos - prefixLen);
                 }
+                else {
+                    // tailChar가 발견되지 않으면 null로 종료된 전체 문자열을 추출
+                    extracted = fullStr.substr(prefixLen);
+                }
+            }
+            if (!extracted.empty()) {
+                extractedIDSet.insert(extracted);
             }
         }
     }
+    return extractedIDSet;
+}
 
-    if (extractedList.size() <= 1) {
-        std::wcout << L"추출된 문자열이 하나뿐이므로 추가하지 않습니다.\n";
-        return;
+void DoExtraction() {
+    const char targetPrefix[] = u8"/aurora-profile-by-toon/";
+    size_t prefixLen = strlen(targetPrefix);
+    const char tailChar = '/';
+	
+    auto extractedList = ExtractStrings(targetPrefix, prefixLen, tailChar);
+    
+    const char targetPrefix_myID[] = u8"HAT:";
+    prefixLen = strlen(targetPrefix_myID);
+	auto extractedList_myID = ExtractStrings(targetPrefix_myID, prefixLen, '\x10');
+
+    // extractedList에서 extractedList_myID에 포함된 모든 값을 제거
+    for (const std::string& extracted_myID : extractedList_myID) {
+        extractedList.erase(extracted_myID);
     }
     std::string string_to_ignore = "\"+encodeURIComponent(r.data.name)+\"";
-    extractedList.erase(std::remove(extractedList.begin(), extractedList.end(), string_to_ignore), extractedList.end());
-    std::string myId = extractedList[0];
+    extractedList.erase(string_to_ignore);
 
     int newCount = 0;
     for (const std::string& extracted : extractedList) {
-        if (extracted != myId && extracted != string_to_ignore) {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            if (g_extractedSet.find(extracted) == g_extractedSet.end()) {
-                g_extractedSet.insert(extracted);
-                g_extractedOrder.push_back(extracted);
-                int size_needed = MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, NULL, 0);
-                std::wstring wextracted(size_needed, 0);
-                MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, &wextracted[0], size_needed);
-                std::wcout << L"추출 값: " << wextracted << L"  -> 추가되었습니다" << std::endl;
-                newCount++;
-                SendToStarCraft("/ignore " + extracted);
-            }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_extractedSet.find(extracted) == g_extractedSet.end()) {
+            g_extractedSet.insert(extracted);
+            int size_needed = MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, NULL, 0);
+            std::wstring wextracted(size_needed, 0);
+            MultiByteToWideChar(CP_UTF8, 0, extracted.c_str(), -1, &wextracted[0], size_needed);
+            std::wcout << L"추출 값: " << wextracted << L"  -> 추가되었습니다" << std::endl;
+            newCount++;
+            SendToStarCraft("/ignore " + extracted);
         }
     }
     if (newCount == 0) {
@@ -236,22 +253,17 @@ void DoExtraction() {
 }
 
 void DoRemoval() {
-    std::string removedId;
+    
+    
+    for (const std::string& removedId : g_extractedSet)
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_extractedOrder.empty()) {
-            std::wcout << L"제거할 id가 없습니다.\n";
-            return;
-        }
-        removedId = g_extractedOrder.back();
-        g_extractedOrder.pop_back();
-        g_extractedSet.erase(removedId);
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, NULL, 0);
+        std::wstring wRemovedId(size_needed, 0);
+        MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, &wRemovedId[0], size_needed);
+        std::wcout << L"제거된 id: " << wRemovedId << std::endl;
+        SendToStarCraft("/unignore " + removedId);
     }
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, NULL, 0);
-    std::wstring wRemovedId(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, &wRemovedId[0], size_needed);
-    std::wcout << L"제거된 id: " << wRemovedId << std::endl;
-    SendToStarCraft("/unignore " + removedId);
+	g_extractedSet.clear();
 }
 
 void StartKeyboardHook()
@@ -275,6 +287,7 @@ void UpdateStarCraftProcess()
     DWORD newPID = GetProcessID(processName);
     if (newPID != 0 && g_starcraftPID != newPID)
     {
+        g_extractedSet.clear();
         g_starcraftPID = newPID;
         if (g_hProcess)
             CloseHandle(g_hProcess);
