@@ -16,6 +16,8 @@
 
 #define IDD_SETTING_DIALOG         101
 #define IDC_SWAP_KEY               1004
+#define IDC_SHOW_MAP_NAME          1005
+#define IDC_AUTO_IGNORE            1006
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
