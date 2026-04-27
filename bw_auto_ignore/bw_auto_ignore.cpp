@@ -298,6 +298,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         bool inGame = IsInGame();
 
         // 인게임 진입 감지 (0→1 전환)
+        if (!g_wasInGame && inGame)
+        {
+            // 새 게임 시작 시 이전 게임 무시 목록 초기화
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_extractedSet.clear();
+        }
         if (!g_wasInGame && inGame && g_autoIgnoreOnGameStart)
         {
             std::thread t(DoExtraction);
