@@ -679,6 +679,40 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 }
 
 
+static const wchar_t* REG_KEY = L"Software\\bw_auto_ignore";
+
+void SaveSettings()
+{
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+    DWORD val;
+    val = g_swapSpaceAndControl ? 1 : 0;
+    RegSetValueExW(hKey, L"SwapSpaceAndControl", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    val = g_showMapName ? 1 : 0;
+    RegSetValueExW(hKey, L"ShowMapName", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    val = g_autoIgnoreOnGameStart ? 1 : 0;
+    RegSetValueExW(hKey, L"AutoIgnoreOnGameStart", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegCloseKey(hKey);
+}
+
+void LoadSettings()
+{
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+        return;
+    DWORD val, size = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"SwapSpaceAndControl", NULL, NULL, (BYTE*)&val, &size) == ERROR_SUCCESS)
+        g_swapSpaceAndControl = (val != 0);
+    size = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"ShowMapName", NULL, NULL, (BYTE*)&val, &size) == ERROR_SUCCESS)
+        g_showMapName = (val != 0);
+    size = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart", NULL, NULL, (BYTE*)&val, &size) == ERROR_SUCCESS)
+        g_autoIgnoreOnGameStart = (val != 0);
+    RegCloseKey(hKey);
+}
+
 INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -694,6 +728,7 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
             g_swapSpaceAndControl = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
             g_showMapName = (IsDlgButtonChecked(hDlg, IDC_SHOW_MAP_NAME) == BST_CHECKED);
             g_autoIgnoreOnGameStart = (IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE) == BST_CHECKED);
+            SaveSettings();
             // 오버레이 즉시 반영
             if (g_hOverlay)
                 InvalidateRect(g_hOverlay, NULL, TRUE);
@@ -811,6 +846,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     // 콘솔 입출력 및 로케일 설정 (디버깅용)
     _setmode(_fileno(stdout), _O_U16TEXT);
     setlocale(LC_ALL, "");
+
+    LoadSettings();
 
     MyRegisterClass(hInstance);
     if (!InitInstance(hInstance, nCmdShow))
