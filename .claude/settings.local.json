@@ -41,7 +41,18 @@
       "Bash(MSBuild bw_auto_ignore.sln /p:Configuration=Debug /p:Platform=x64 /t:Build /v:minimal)",
       "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" \"C:/wd/bw_auto_ignore/bw_auto_ignore.sln\" /p:Configuration=Debug /p:Platform=x64 /t:Build /v:minimal)",
       "Bash(ls \"C:/wd/bw_auto_ignore/bw_auto_ignore/imgui\"*)",
-      "Bash(C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe:*)"
+      "Bash(C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe:*)",
+      "Bash(git commit:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh search:*)",
+      "Bash(python3 -c \"import json,sys; [print\\(x['name']\\) for x in json.load\\(sys.stdin\\)]\")",
+      "Bash(python3 -c ':*)",
+      "WebFetch(domain:blizztrack.com)",
+      "WebFetch(domain:www.macupdater.net)",
+      "WebFetch(domain:liquipedia.net)",
+      "Bash(gh repo:*)"
     ]
   }
 }

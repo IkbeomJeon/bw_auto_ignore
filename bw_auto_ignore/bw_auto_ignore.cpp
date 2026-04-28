@@ -466,37 +466,35 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         if (!name.empty() && guid > 0) guidMap[guid] = {name, gw};
     });
 
-    // toon_guid_by_gateway 에서 guid→gateway 보완 (toons[]에 없는 경우 대비)
-    // 구조: {"30": {"toon_name": guid, ...}, ...}
+    // toon_guid_by_gateway 에서 name→gateway 맵 빌드 (폴백용)
+    // 구조: {"30": {"toon_name": guid, ...}, "10": {...}, ...}
+    std::map<std::string, int> nameToGw;
     {
-        const int knownGws[] = {10, 11, 12, 20, 30};
-        for (int gw : knownGws) {
-            std::string gwKey = "\"" + std::to_string(gw) + "\"";
-            size_t gwPos = json.find("\"toon_guid_by_gateway\"");
-            if (gwPos == std::string::npos) break;
+        size_t gwPos = json.find("\"toon_guid_by_gateway\"");
+        if (gwPos != std::string::npos) {
             size_t blockStart = json.find('{', gwPos);
-            if (blockStart == std::string::npos) break;
-            size_t blockEnd = FindMatchingBrace(json, blockStart);
-            std::string block = json.substr(blockStart, blockEnd - blockStart + 1);
-            size_t kp = block.find(gwKey);
-            if (kp == std::string::npos) continue;
-            size_t ob = block.find('{', kp);
-            if (ob == std::string::npos) continue;
-            size_t oe = FindMatchingBrace(block, ob);
-            std::string inner = block.substr(ob + 1, oe - ob - 1);
-            // 각 "name": guid 파싱
-            size_t p = 0;
-            while (p < inner.size()) {
-                size_t qs = inner.find('"', p); if (qs == std::string::npos) break;
-                size_t qe = inner.find('"', qs + 1); if (qe == std::string::npos) break;
-                std::string tname = inner.substr(qs + 1, qe - qs - 1);
-                size_t cp = inner.find(':', qe); if (cp == std::string::npos) break;
-                int guid = atoi(inner.c_str() + cp + 1);
-                if (!tname.empty() && guid > 0 && guidMap.find(guid) == guidMap.end())
-                    guidMap[guid] = {tname, gw};
-                p = cp + 1;
-                size_t comma = inner.find(',', p);
-                p = (comma != std::string::npos) ? comma + 1 : inner.size();
+            if (blockStart != std::string::npos) {
+                size_t blockEnd = FindMatchingBrace(json, blockStart);
+                std::string block = json.substr(blockStart, blockEnd - blockStart + 1);
+                const int knownGws[] = {10, 11, 12, 20, 30};
+                for (int gw : knownGws) {
+                    std::string gwKey = "\"" + std::to_string(gw) + "\"";
+                    size_t kp = block.find(gwKey);
+                    if (kp == std::string::npos) continue;
+                    size_t ob = block.find('{', kp);
+                    if (ob == std::string::npos) continue;
+                    size_t oe = FindMatchingBrace(block, ob);
+                    std::string inner = block.substr(ob + 1, oe - ob - 1);
+                    size_t p = 0;
+                    while (p < inner.size()) {
+                        size_t qs = inner.find('"', p); if (qs == std::string::npos) break;
+                        size_t qe = inner.find('"', qs + 1); if (qe == std::string::npos) break;
+                        std::string tname = inner.substr(qs + 1, qe - qs - 1);
+                        if (!tname.empty()) nameToGw[tname] = gw;
+                        size_t comma = inner.find(',', qe);
+                        p = (comma != std::string::npos) ? comma + 1 : inner.size();
+                    }
+                }
             }
         }
     }
@@ -535,6 +533,10 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         int gw = 0;
         auto it = guidMap.find(guid);
         if (it != guidMap.end()) gw = it->second.gateway;
+        if (gw == 0) {
+            auto nit = nameToGw.find(name);
+            if (nit != nameToGw.end()) gw = nit->second;
+        }
         allStats[{name, gw}].push_back({sid, bkt, rat, ws, ls});
     });
 
@@ -776,7 +778,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // }).detach();
         }
         if (!g_wasInGame && inGame && g_autoIgnoreOnGameStart) {
-            std::thread t(DoExtraction); t.detach();
+            // 게임 시작 직후 플레이어 테이블이 채워지기까지 대기
+            std::thread([](){
+                Sleep(1500);
+                DoExtraction();
+            }).detach();
         }
         g_wasInGame = inGame;
         g_isInGame  = inGame;
@@ -1086,7 +1092,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wParam) == 1002) MessageBox(hWnd, L"F9: ignore\nF8: unignore\nF1: settings GUI", L"Help", MB_OK | MB_ICONINFORMATION);
+        if (LOWORD(wParam) == 1002) MessageBox(hWnd, L"F9: ignore\nF8: unignore\nF12: 전적 GUI", L"Help", MB_OK | MB_ICONINFORMATION);
         else if (LOWORD(wParam) == 1003) DestroyWindow(hWnd);
         else if (LOWORD(wParam) == 1004) DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWnd, SettingDlgProc);
         break;
