@@ -1,9 +1,15 @@
-﻿#define NOMINMAX
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+#include <d3d11.h>
+#include <dxgi.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #include <string>
 #include <iostream>
 #include <vector>
@@ -19,6 +25,11 @@
 #include <iterator>
 #include <map>
 #include "resource.h"
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // ---------------------------------------------------------------------------
 // StarCraft.exe 메모리 오프셋 상수
@@ -26,18 +37,17 @@
 const ULONGLONG PLAYER_TABLE_OFFSET = 0x10931B0;
 const int PLAYER_SLOT_SIZE  = 104;
 const int PLAYER_SLOT_COUNT = 8;
-const int PLAYER_NAME_OFFSET = 8;   // 슬롯 내 이름 시작 위치
+const int PLAYER_NAME_OFFSET = 8;
 
-const ULONGLONG CHAT_MODE_OFFSET  = 0x1094323; // 채팅 입력 중: 1, 아님: 0
-const ULONGLONG MAP_NAME_OFFSET   = 0x1091FEE; // 현재 맵 이름 (UTF-8)
-const ULONGLONG IS_IN_GAME_OFFSET = 0x1090612; // 인게임: 1, 로비/메뉴: 0
+const ULONGLONG CHAT_MODE_OFFSET  = 0x1094323;
+const ULONGLONG MAP_NAME_OFFSET   = 0x1091FEE;
+const ULONGLONG IS_IN_GAME_OFFSET = 0x1090612;
 
 // ---------------------------------------------------------------------------
 // 전역 변수
 // ---------------------------------------------------------------------------
 int KEY_IGNORE = VK_F9;
 int KEY_UNIGNORE = VK_F8;
-//int KEY_ADDITIONAL_CTRL = VK_APPS;
 int KEY_ADDITIONAL_CTRL = VK_SPACE;
 int KEY_SWAP_CTRL = VK_F12;
 
@@ -47,22 +57,30 @@ HANDLE g_hProcess = NULL;
 std::set<std::string> g_extractedSet;
 std::mutex g_mutex;
 HHOOK g_hHook = NULL;
-HINSTANCE hInst;                    // 현재 인스턴스
-WCHAR szWindowClass[] = L"BW_AutoIgnoreWndClass"; // 윈도우 클래스 이름
-NOTIFYICONDATA nid = { 0 };           // 시스템 트레이 아이콘 데이터
+HINSTANCE hInst;
+WCHAR szWindowClass[] = L"BW_AutoIgnoreWndClass";
+NOTIFYICONDATA nid = { 0 };
 
-bool g_swapSpaceAndControl = true;    // 키 리매핑 활성화 여부
-bool g_chatMode = false;              // 채팅 입력 중 여부
-bool g_showMapName = true;            // 맵 이름 오버레이 표시 여부
-bool g_autoIgnoreOnGameStart = false; // 게임 시작 시 자동 무시 여부
-bool g_isInGame = false;              // 현재 인게임 여부 (타이머에서 갱신)
-bool g_wasInGame = false;             // 직전 인게임 여부 (전환 감지용)
-ULONGLONG g_scModuleBase = 0;         // StarCraft.exe 모듈 베이스 캐시
+bool g_swapSpaceAndControl = true;
+bool g_chatMode = false;
+bool g_showMapName = true;
+bool g_autoIgnoreOnGameStart = false;
+bool g_copyBattleTagOnGameStart = false;
+bool g_isInGame = false;
+bool g_wasInGame = false;
+ULONGLONG g_scModuleBase = 0;
 
-HWND g_hOverlay = NULL;               // 오버레이 창
-HWND g_hStarCraftWnd = NULL;          // StarCraft 창 핸들
-std::wstring g_mapName = L"";         // 현재 맵 이름
-const COLORREF OVERLAY_TRANSPARENT = RGB(0, 0, 1); // 투명 처리할 색상 (배경)
+HWND g_hOverlay = NULL;
+HWND g_hStarCraftWnd = NULL;
+std::wstring g_mapName = L"";
+
+// D3D11 + imgui
+ID3D11Device*           g_pd3dDevice       = NULL;
+ID3D11DeviceContext*    g_pd3dContext       = NULL;
+IDXGISwapChain*         g_pSwapChain       = NULL;
+ID3D11RenderTargetView* g_pRenderTargetView = NULL;
+bool                    g_imguiInitialized  = false;
+bool                    g_showGui           = false; // ` 키로 토글
 
 // ---------------------------------------------------------------------------
 // 함수 선언
@@ -90,6 +108,8 @@ void CreateOverlayWindow(HINSTANCE hInstance);
 
 void DoExtraction();
 void DoRemoval();
+void CopyOpponentBattleTagsToClipboard();
+void SaveSettings();
 
 void StartKeyboardHook();
 void StopKeyboardHook();
@@ -104,11 +124,7 @@ void ProcessMonitorThread();
 DWORD GetProcessID(const wchar_t* processName)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-    {
-        std::wcout << L"스냅샷 생성 실패. 오류 코드: " << GetLastError() << L"\n";
-        return 0;
-    }
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe32{};
     pe32.dwSize = sizeof(PROCESSENTRY32W);
     if (Process32FirstW(snapshot, &pe32))
@@ -122,7 +138,6 @@ DWORD GetProcessID(const wchar_t* processName)
         } while (Process32NextW(snapshot, &pe32));
     }
     CloseHandle(snapshot);
-    std::wcout << L"프로세스를 찾을 수 없습니다.\n";
     return 0;
 }
 
@@ -162,18 +177,15 @@ std::wstring ReadMapName()
     SIZE_T bytesRead = 0;
     ReadProcessMemory(g_hProcess, reinterpret_cast<LPCVOID>(base + MAP_NAME_OFFSET), buf, sizeof(buf), &bytesRead);
 
-    // null 종료 위치 찾기
     size_t len = 0;
     while (len < bytesRead && buf[len] != 0) len++;
 
-    // UTF-8 → wstring 변환 (포맷 코드 0x01~0x1F 제거)
     std::string utf8(reinterpret_cast<char*>(buf), len);
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, NULL, 0);
     if (wlen <= 0) return L"";
     std::wstring wide(wlen, 0);
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], wlen);
 
-    // 제어 문자 제거 (StarCraft 색상 코드 등)
     std::wstring result;
     for (wchar_t c : wide)
         if (c >= 0x20) result += c;
@@ -200,7 +212,7 @@ BOOL CALLBACK FindWindowByPID(HWND hwnd, LPARAM lParam)
     if (pid == data->pid && IsWindowVisible(hwnd))
     {
         data->hwnd = hwnd;
-        return FALSE; // 찾으면 중단
+        return FALSE;
     }
     return TRUE;
 }
@@ -226,101 +238,172 @@ void UpdateOverlayPosition()
         return;
     }
 
-    // StarCraft가 포그라운드가 아니거나 인게임이 아니면 숨김
     HWND hFg = GetForegroundWindow();
-    if (hFg != hSC || !g_isInGame)
+    bool scOrOverlayFg = (hFg == hSC || hFg == g_hOverlay);
+
+    // 인게임이거나 GUI가 열려있을 때만 표시
+    if (!scOrOverlayFg || (!g_isInGame && !g_showGui))
     {
         ShowWindow(g_hOverlay, SW_HIDE);
         return;
     }
 
-    // StarCraft 클라이언트 영역을 스크린 좌표로 변환
     RECT clientRect;
     GetClientRect(hSC, &clientRect);
-    POINT topLeft = { clientRect.left, clientRect.top };
+    POINT topLeft = { 0, 0 };
     ClientToScreen(hSC, &topLeft);
 
     int x = topLeft.x;
     int y = topLeft.y;
     int w = clientRect.right - clientRect.left;
-    int h = 40;
+    int h = clientRect.bottom - clientRect.top;
 
     SetWindowPos(g_hOverlay, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     ShowWindow(g_hOverlay, SW_SHOW);
 }
 
+// ---------------------------------------------------------------------------
+// D3D11 헬퍼
+// ---------------------------------------------------------------------------
+static void CreateRenderTarget()
+{
+    ID3D11Texture2D* pBack = NULL;
+    g_pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBack);
+    if (pBack)
+    {
+        g_pd3dDevice->CreateRenderTargetView(pBack, NULL, &g_pRenderTargetView);
+        pBack->Release();
+    }
+}
+
+static void CleanupRenderTarget()
+{
+    if (g_pRenderTargetView) { g_pRenderTargetView->Release(); g_pRenderTargetView = NULL; }
+}
+
+static void RenderOverlay()
+{
+    if (!g_imguiInitialized || !g_pRenderTargetView) return;
+
+    float clear[4] = { 0.0f, 1.0f, 0.0f, 1.0f }; // pure green = 색상 키로 투명 처리됨
+    g_pd3dContext->OMSetRenderTargets(1, &g_pRenderTargetView, NULL);
+    g_pd3dContext->ClearRenderTargetView(g_pRenderTargetView, clear);
+
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    // 맵 이름 (인게임 + 설정 ON)
+    if (g_showMapName && !g_mapName.empty() && g_isInGame)
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 8.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.0f);
+        ImGui::Begin("##mapname", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav);
+
+        std::string utf8name(g_mapName.size() * 3 + 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, g_mapName.c_str(), -1,
+            &utf8name[0], (int)utf8name.size(), NULL, NULL);
+
+        ImGui::SetWindowFontScale(1.4f);
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (int dx = -2; dx <= 2; dx++)
+            for (int dy = -2; dy <= 2; dy++)
+                if (dx || dy)
+                    dl->AddText(ImVec2(pos.x + dx, pos.y + dy), IM_COL32(0, 0, 0, 220), utf8name.c_str());
+        ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", utf8name.c_str());
+        ImGui::End();
+    }
+
+    // 설정 GUI (` 키로 토글)
+    if (g_showGui)
+    {
+        ImGui::SetNextWindowSize(ImVec2(330, 160), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_Once);
+        ImGui::Begin(u8"bw_auto_ignore 설정", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+
+        bool v;
+        v = g_swapSpaceAndControl;
+        if (ImGui::Checkbox(u8"스페이스바를 컨트롤로 이용하기 (F12)", &v))
+        { g_swapSpaceAndControl = v; SaveSettings(); }
+
+        v = g_showMapName;
+        if (ImGui::Checkbox(u8"맵 이름 표시", &v))
+        { g_showMapName = v; SaveSettings(); }
+
+        v = g_autoIgnoreOnGameStart;
+        if (ImGui::Checkbox(u8"게임 시작 시 채팅 자동 무시", &v))
+        { g_autoIgnoreOnGameStart = v; SaveSettings(); }
+
+        v = g_copyBattleTagOnGameStart;
+        if (ImGui::Checkbox(u8"상대방 배틀태그를 클립보드로 복사", &v))
+        { g_copyBattleTagOnGameStart = v; SaveSettings(); }
+
+        ImGui::Spacing();
+        if (ImGui::Button(u8"닫기 (` 키)"))
+        {
+            g_showGui = false;
+            LONG_PTR ex = GetWindowLongPtr(g_hOverlay, GWL_EXSTYLE);
+            SetWindowLongPtr(g_hOverlay, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+        }
+        ImGui::End();
+    }
+
+    ImGui::Render();
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    g_pSwapChain->Present(0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 오버레이 윈도우 프로시저
+// ---------------------------------------------------------------------------
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (g_imguiInitialized && g_showGui)
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam))
+            return 1;
+
     switch (message)
     {
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        RECT rc;
-        GetClientRect(hWnd, &rc);
-
-        // 배경을 투명 색상으로 채우기
-        HBRUSH hBrush = CreateSolidBrush(OVERLAY_TRANSPARENT);
-        FillRect(hdc, &rc, hBrush);
-        DeleteObject(hBrush);
-
-        if (g_showMapName && !g_mapName.empty() && g_starcraftPID != 0)
+    case WM_SIZE:
+        if (g_pd3dDevice && wParam != SIZE_MINIMIZED)
         {
-            HFONT hFont = CreateFont(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Arial");
-            HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
-
-            SetBkMode(hdc, TRANSPARENT);
-
-            // 외곽선 효과 (검정 그림자)
-            SetTextColor(hdc, RGB(0, 0, 0));
-            RECT shadow = rc;
-            for (int dx = -2; dx <= 2; dx++)
-                for (int dy = -2; dy <= 2; dy++) {
-                    RECT sr = { rc.left + dx, rc.top + dy, rc.right + dx, rc.bottom + dy };
-                    DrawText(hdc, g_mapName.c_str(), -1, &sr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                }
-
-            // 본문 (흰색)
-            SetTextColor(hdc, RGB(255, 255, 255));
-            DrawText(hdc, g_mapName.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            SelectObject(hdc, hOldFont);
-            DeleteObject(hFont);
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            CreateRenderTarget();
         }
-        EndPaint(hWnd, &ps);
         return 0;
-    }
     case WM_TIMER:
     {
         bool inGame = IsInGame();
 
-        // 인게임 진입 감지 (0→1 전환)
         if (!g_wasInGame && inGame)
         {
-            // 새 게임 시작 시 이전 게임 무시 목록 초기화
             std::lock_guard<std::mutex> lock(g_mutex);
             g_extractedSet.clear();
         }
         if (!g_wasInGame && inGame && g_autoIgnoreOnGameStart)
         {
-            std::thread t(DoExtraction);
-            t.detach();
+            std::thread t(DoExtraction); t.detach();
+        }
+        if (!g_wasInGame && inGame && g_copyBattleTagOnGameStart)
+        {
+            std::thread t(CopyOpponentBattleTagsToClipboard); t.detach();
         }
         g_wasInGame = inGame;
-        g_isInGame = inGame;
+        g_isInGame  = inGame;
 
         UpdateOverlayPosition();
 
-        // 맵 이름 갱신 (인게임일 때만)
         std::wstring newName = inGame ? ReadMapName() : L"";
         if (newName != g_mapName)
-        {
             g_mapName = newName;
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
+
+        RenderOverlay();
         return 0;
     }
     case WM_DESTROY:
@@ -330,53 +413,104 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
     return DefWindowProc(hWnd, message, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------
+// 오버레이 창 생성 (D3D11 + imgui)
+// ---------------------------------------------------------------------------
 void CreateOverlayWindow(HINSTANCE hInstance)
 {
     WNDCLASSEX wcex = { 0 };
     wcex.cbSize       = sizeof(WNDCLASSEX);
     wcex.lpfnWndProc  = OverlayWndProc;
     wcex.hInstance    = hInstance;
-    wcex.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wcex.lpszClassName = L"BW_OverlayWndClass";
     RegisterClassEx(&wcex);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
 
     g_hOverlay = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         L"BW_OverlayWndClass", L"",
         WS_POPUP,
-        0, 0, 100, 40,  // 초기 크기는 임시, UpdateOverlayPosition에서 조정됨
+        0, 0, sw, sh,
         NULL, NULL, hInstance, NULL
     );
 
-    SetLayeredWindowAttributes(g_hOverlay, OVERLAY_TRANSPARENT, 160, LWA_COLORKEY | LWA_ALPHA); // 반투명 (160/255)
-    SetTimer(g_hOverlay, 1, 100, NULL); // 0.1초마다 위치 갱신
+    // 색상 키 투명도: pure green(0,255,0) 픽셀을 투명으로 처리
+    // imgui 다크 테마는 순수 초록(0,255,0)을 출력하지 않으므로 안전
+    SetLayeredWindowAttributes(g_hOverlay, RGB(0, 255, 0), 0, LWA_COLORKEY);
+
+    // D3D11 디바이스 + 스왑체인 생성
+    // BGRA 포맷 사용 (DWM 합성에 필요)
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount                        = 2;
+    sd.BufferDesc.Width                   = sw;
+    sd.BufferDesc.Height                  = sh;
+    sd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator   = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow                       = g_hOverlay;
+    sd.SampleDesc.Count                   = 1;
+    sd.Windowed                           = TRUE;
+    sd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    sd.Flags                              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+
+    D3D_FEATURE_LEVEL featureLevel;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+        NULL, 0, D3D11_SDK_VERSION, &sd,
+        &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dContext);
+
+    if (FAILED(hr))
+    {
+        MessageBox(NULL, L"D3D11 초기화 실패. 오버레이를 사용할 수 없습니다.", L"오류", MB_OK);
+        return;
+    }
+
+    CreateRenderTarget();
+
+    // imgui 초기화
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr; // imgui.ini 비활성화 (창 위치 저장 안 함)
+
+    // 한글 폰트 로드
+    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\malgun.ttf", 16.0f,
+        nullptr, io.Fonts->GetGlyphRangesKorean());
+
+    ImGui::StyleColorsDark();
+    ImGui::GetStyle().Colors[ImGuiCol_WindowBg].w = 0.85f;
+
+    ImGui_ImplWin32_Init(g_hOverlay);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dContext);
+    g_imguiInitialized = true;
+
+    SetTimer(g_hOverlay, 1, 33, NULL); // ~30fps
     UpdateOverlayPosition();
 }
 
+// ---------------------------------------------------------------------------
+// 플레이어 / 무시 관련 함수
+// ---------------------------------------------------------------------------
 std::set<std::string> ReadCurrentGamePlayers()
 {
     ULONGLONG base = GetStarCraftModuleBase();
-    if (base == 0)
-    {
-        std::wcout << L"StarCraft.exe 모듈 베이스를 찾을 수 없습니다.\n";
-        return {};
-    }
+    if (base == 0) return {};
 
     ULONGLONG tableAddr = base + PLAYER_TABLE_OFFSET;
     std::vector<BYTE> buf(PLAYER_SLOT_SIZE * PLAYER_SLOT_COUNT, 0);
     SIZE_T bytesRead = 0;
     if (!ReadProcessMemory(g_hProcess, reinterpret_cast<LPCVOID>(tableAddr), buf.data(), buf.size(), &bytesRead))
-    {
-        std::wcout << L"플레이어 테이블 읽기 실패. 오류: " << GetLastError() << L"\n";
         return {};
-    }
 
     std::set<std::string> players;
     for (int i = 0; i < PLAYER_SLOT_COUNT; i++)
     {
         BYTE* slot = buf.data() + i * PLAYER_SLOT_SIZE;
-        if (slot[0] != 0x01) continue;  // 비활성 슬롯 스킵
-
+        if (slot[0] != 0x01) continue;
         char* name = reinterpret_cast<char*>(slot + PLAYER_NAME_OFFSET);
         size_t nameLen = strnlen(name, PLAYER_SLOT_SIZE - PLAYER_NAME_OFFSET);
         if (nameLen > 0)
@@ -401,7 +535,6 @@ std::string ReadNullTerminatedString(HANDLE hProcess, ULONGLONG address, size_t 
 
 std::vector<ULONGLONG> FindAllPrefixAddresses(HANDLE hProcess, const char* targetPrefix)
 {
-    std::wcout << L"감지를 시작합니다..." << std::endl;
     std::vector<ULONGLONG> addresses;
     size_t prefixLength = strlen(targetPrefix);
     ULONGLONG currentAddress = 0;
@@ -461,62 +594,43 @@ void SendVirtualKey(WORD vk)
 void SendToStarCraft(std::string command)
 {
     SendVirtualKey(VK_RETURN);
-    //std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, NULL, 0);
     std::wstring wcommand(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, command.c_str(), -1, &wcommand[0], size_needed);
     SendUnicodeString(wcommand);
-    //std::this_thread::sleep_for(std::chrono::milliseconds(10));
     SendVirtualKey(VK_RETURN);
 }
 
 std::set<std::string> ExtractStrings(const char* targetPrefix, size_t prefixLen, char tailChar = '\0')
 {
     std::vector<ULONGLONG> addresses = FindAllPrefixAddresses(g_hProcess, targetPrefix);
+    if (addresses.empty()) return {};
 
-    if (addresses.empty()) {
-        std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
-        return {};
-    }
     std::set<std::string> extractedIDSet;
-
     for (ULONGLONG addr : addresses) {
         std::string fullStr = ReadNullTerminatedString(g_hProcess, addr);
         if (fullStr.compare(0, prefixLen, targetPrefix) == 0) {
             std::string extracted;
             if (tailChar == '\0') {
-                // tailChar이 전달되지 않은 경우, 접두어 이후 전체 문자열(즉, null까지)을 추출
                 extracted = fullStr.substr(prefixLen);
-            }
-            else {
+            } else {
                 size_t endPos = fullStr.find(tailChar, prefixLen);
-                if (endPos != std::string::npos && endPos > prefixLen) {
-                    extracted = fullStr.substr(prefixLen, endPos - prefixLen);
-                }
-                else {
-                    // tailChar가 발견되지 않으면 null로 종료된 전체 문자열을 추출
-                    extracted = fullStr.substr(prefixLen);
-                }
+                extracted = (endPos != std::string::npos && endPos > prefixLen)
+                    ? fullStr.substr(prefixLen, endPos - prefixLen)
+                    : fullStr.substr(prefixLen);
             }
-            if (!extracted.empty()) {
+            if (!extracted.empty())
                 extractedIDSet.insert(extracted);
-            }
         }
     }
     return extractedIDSet;
 }
 
-void DoExtraction() {
-    // 현재 게임 플레이어 테이블에서 직접 읽기
+void DoExtraction()
+{
     auto currentPlayers = ReadCurrentGamePlayers();
+    if (currentPlayers.empty()) return;
 
-    if (currentPlayers.empty()) {
-        std::wcout << L"현재 게임 플레이어를 찾을 수 없습니다 (게임 중이 아닐 수 있습니다).\n";
-        return;
-    }
-
-    // 본인 ID 제거 (HAT: 접두사로 검색)
     const char targetPrefix_myID[] = u8"HAT:";
     size_t prefixLen = strlen(targetPrefix_myID);
     auto myIDs = ExtractStrings(targetPrefix_myID, prefixLen, '\x10');
@@ -528,30 +642,175 @@ void DoExtraction() {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_extractedSet.find(playerName) == g_extractedSet.end()) {
             g_extractedSet.insert(playerName);
-            int size_needed = MultiByteToWideChar(CP_UTF8, 0, playerName.c_str(), -1, NULL, 0);
-            std::wstring wName(size_needed, 0);
-            MultiByteToWideChar(CP_UTF8, 0, playerName.c_str(), -1, &wName[0], size_needed);
-            std::wcout << L"추출 값: " << wName << L"  -> 추가되었습니다" << std::endl;
             newCount++;
             SendToStarCraft("/ignore " + playerName);
         }
     }
-    if (newCount == 0)
-        std::wcout << L"새로운 값이 발견되지 않았습니다.\n";
 }
 
-void DoRemoval() {
-    
-    
+void DoRemoval()
+{
     for (const std::string& removedId : g_extractedSet)
-    {
-        int size_needed = MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, NULL, 0);
-        std::wstring wRemovedId(size_needed, 0);
-        MultiByteToWideChar(CP_UTF8, 0, removedId.c_str(), -1, &wRemovedId[0], size_needed);
-        std::wcout << L"제거된 id: " << wRemovedId << std::endl;
         SendToStarCraft("/unignore " + removedId);
+    g_extractedSet.clear();
+}
+
+// StarCraft 로컬 웹서버 포트를 메모리에서 찾기
+static WORD FindLocalWebApiPort()
+{
+    if (g_hProcess == NULL) return 0;
+    const char pattern[] = "127.0.0.1:";
+    const char webApiSuffix[] = "/web-api/";
+    MEMORY_BASIC_INFORMATION mbi = {};
+    ULONGLONG addr = 0;
+    WORD foundPort = 0;
+
+    while (VirtualQueryEx(g_hProcess, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)))
+    {
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+            && mbi.RegionSize > 0 && mbi.RegionSize < 0x20000000)
+        {
+            std::vector<char> buf(mbi.RegionSize);
+            SIZE_T bytesRead = 0;
+            if (ReadProcessMemory(g_hProcess, reinterpret_cast<LPCVOID>(addr), buf.data(), mbi.RegionSize, &bytesRead))
+            {
+                size_t i = 0;
+                while (i + sizeof(pattern) + 10 < bytesRead)
+                {
+                    if (memcmp(buf.data() + i, pattern, sizeof(pattern) - 1) == 0)
+                    {
+                        size_t portStart = i + sizeof(pattern) - 1;
+                        size_t portEnd = portStart;
+                        while (portEnd < bytesRead && buf[portEnd] >= '0' && buf[portEnd] <= '9')
+                            portEnd++;
+                        size_t portLen = portEnd - portStart;
+                        if (portLen >= 4 && portLen <= 5 &&
+                            portEnd + sizeof(webApiSuffix) - 1 < bytesRead &&
+                            memcmp(buf.data() + portEnd, webApiSuffix, sizeof(webApiSuffix) - 1) == 0)
+                        {
+                            int port = atoi(buf.data() + portStart);
+                            if (port > 1024 && port < 65536)
+                            {
+                                foundPort = (WORD)port;
+                                addr += (mbi.RegionSize > 0 ? mbi.RegionSize : 1);
+                                goto done;
+                            }
+                        }
+                    }
+                    i++;
+                }
+            }
+        }
+        addr += (mbi.RegionSize > 0 ? mbi.RegionSize : 1);
+        if (addr == 0) break;
     }
-	g_extractedSet.clear();
+done:
+    return foundPort;
+}
+
+static std::string LocalWebApiGet(const std::string& inGameName, WORD port)
+{
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, inGameName.c_str(), -1, NULL, 0);
+    std::wstring wname(wlen, 0);
+    MultiByteToWideChar(CP_UTF8, 0, inGameName.c_str(), -1, &wname[0], wlen);
+    std::wstring path = L"/web-api/v2/aurora-profile-by-toon/" + wname + L"/30?request_flags=scr_tooninfo";
+
+    HINTERNET hSession = WinHttpOpen(L"StarCraft/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+    HINTERNET hConnect = WinHttpConnect(hSession, L"127.0.0.1", port, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return ""; }
+
+    std::string result;
+    if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hRequest, NULL))
+    {
+        DWORD dwSize = 0;
+        do {
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
+            std::vector<char> buf(dwSize + 1, 0);
+            DWORD dwRead = 0;
+            WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead);
+            result.append(buf.data(), dwRead);
+        } while (dwSize > 0);
+    }
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+static std::string JsonStringVal(const std::string& json, const std::string& key, size_t from = 0)
+{
+    std::string fullKey = "\"" + key + "\":\"";
+    size_t pos = json.find(fullKey, from);
+    if (pos == std::string::npos) return "";
+    size_t start = pos + fullKey.size();
+    size_t end   = json.find('"', start);
+    if (end == std::string::npos) return "";
+    return json.substr(start, end - start);
+}
+
+void CopyOpponentBattleTagsToClipboard()
+{
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    if (g_hProcess == NULL) return;
+
+    auto players = ReadCurrentGamePlayers();
+    if (players.empty()) return;
+
+    const char targetPrefix_myID[] = u8"HAT:";
+    size_t prefixLen = strlen(targetPrefix_myID);
+    auto myIDs = ExtractStrings(targetPrefix_myID, prefixLen, '\x10');
+    for (const std::string& myID : myIDs)
+        players.erase(myID);
+
+    WORD port = FindLocalWebApiPort();
+    std::wstring clipText;
+
+    for (const auto& name : players)
+    {
+        std::string battleTag;
+        if (port > 0)
+        {
+            std::string json = LocalWebApiGet(name, port);
+            battleTag = JsonStringVal(json, "battle_tag");
+        }
+        if (battleTag.empty()) continue;
+
+        int taglen = MultiByteToWideChar(CP_UTF8, 0, battleTag.c_str(), -1, NULL, 0);
+        std::wstring wtag(taglen, 0);
+        MultiByteToWideChar(CP_UTF8, 0, battleTag.c_str(), -1, &wtag[0], taglen);
+
+        if (!clipText.empty()) clipText += L"\r\n";
+        clipText += wtag + L"#";
+    }
+
+    if (clipText.empty()) return;
+
+    if (OpenClipboard(NULL))
+    {
+        EmptyClipboard();
+        size_t bytes = (clipText.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hMem)
+        {
+            memcpy(GlobalLock(hMem), clipText.c_str(), bytes);
+            GlobalUnlock(hMem);
+            SetClipboardData(CF_UNICODETEXT, hMem);
+        }
+        CloseClipboard();
+    }
+
+    nid.uFlags = NIF_INFO;
+    wcscpy_s(nid.szInfoTitle, L"BattleTag Copied");
+    wcscpy_s(nid.szInfo, clipText.c_str());
+    nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIcon(NIM_MODIFY, &nid);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 }
 
 void StartKeyboardHook()
@@ -578,13 +837,8 @@ void UpdateStarCraftProcess()
         g_extractedSet.clear();
         g_scModuleBase = 0;
         g_starcraftPID = newPID;
-        if (g_hProcess)
-            CloseHandle(g_hProcess);
+        if (g_hProcess) CloseHandle(g_hProcess);
         g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, g_starcraftPID);
-        if (g_hProcess == NULL)
-        {
-            std::wcout << L"OpenProcess 실패. 오류 코드: " << GetLastError() << L"\n";
-        }
     }
 }
 
@@ -598,7 +852,7 @@ void ProcessMonitorThread()
 }
 
 // ---------------------------------------------------------------------------
-// 후킹 및 창 관련 콜백 함수들
+// 키보드 훅
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
@@ -609,25 +863,38 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         INPUT input = { 0 };
         input.type = INPUT_KEYBOARD;
 
-        // 포그라운드 창의 프로세스 ID 확인
         HWND hForeground = GetForegroundWindow();
         DWORD foregroundPID = 0;
         GetWindowThreadProcessId(hForeground, &foregroundPID);
 
-        // StarCraft 창에서 F9와 F8 키로 추출/제거 실행
+        bool scFg      = (foregroundPID == g_starcraftPID);
+        bool overlayFg = (hForeground == g_hOverlay);
+
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
-            if (foregroundPID == g_starcraftPID)
+            // F1 키: GUI 토글 — SC나 overlay가 포그라운드일 때 (SC-only 블록 밖에서 처리)
+            if (pKbd->vkCode == VK_F1 && (scFg || overlayFg) && g_hOverlay)
+            {
+                g_showGui = !g_showGui;
+                LONG_PTR ex = GetWindowLongPtr(g_hOverlay, GWL_EXSTYLE);
+                if (g_showGui)
+                    SetWindowLongPtr(g_hOverlay, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+                else
+                    SetWindowLongPtr(g_hOverlay, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+                UpdateOverlayPosition();
+                RenderOverlay();
+                return 1; // SC에 전달하지 않음
+            }
+
+            if (scFg)
             {
                 if (pKbd->vkCode == KEY_IGNORE)
                 {
-                    std::thread extractionThread(DoExtraction);
-                    extractionThread.detach();
+                    std::thread t(DoExtraction); t.detach();
                 }
                 if (pKbd->vkCode == KEY_UNIGNORE)
                 {
-                    std::thread removalThread(DoRemoval);
-                    removalThread.detach();
+                    std::thread t(DoRemoval); t.detach();
                 }
                 if (pKbd->vkCode == VK_RETURN)
                 {
@@ -637,34 +904,26 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 {
                     g_chatMode = false;
                 }
-                if(pKbd->vkCode == KEY_SWAP_CTRL)
+                if (pKbd->vkCode == KEY_SWAP_CTRL)
                 {
                     g_swapSpaceAndControl = !g_swapSpaceAndControl;
-                    std::wcout << L"Spacebar to Control swap "
-                        << (g_swapSpaceAndControl ? L"enabled" : L"disabled")
-                        << std::endl;
-                    // 설정 대화상자가 열려 있다면 체크박스 상태 업데이트
                     if (g_hSettingDlg)
-                    {
                         CheckDlgButton(g_hSettingDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
-                    }
-                    return 1; // F12 키 이벤트 차단
+                    return 1;
                 }
             }
 
-            // StarCraft 창에서만, g_swapSpaceAndControl이 활성화된 경우
-            // 스페이스바(KEY_ADDITIONAL_CTRL)를 컨트롤키로 리매핑
-            if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && g_isInGame && !g_chatMode && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
+            if (scFg && g_swapSpaceAndControl && g_isInGame && !g_chatMode && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
             {
                 input.ki.wVk = VK_CONTROL;
-                input.ki.dwFlags = 0; // key down
+                input.ki.dwFlags = 0;
                 SendInput(1, &input, sizeof(INPUT));
                 blockEvent = true;
             }
         }
         else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
         {
-            if (foregroundPID == g_starcraftPID && g_swapSpaceAndControl && g_isInGame && !g_chatMode && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
+            if (scFg && g_swapSpaceAndControl && g_isInGame && !g_chatMode && pKbd->vkCode == KEY_ADDITIONAL_CTRL)
             {
                 input.ki.wVk = VK_CONTROL;
                 input.ki.dwFlags = KEYEVENTF_KEYUP;
@@ -672,13 +931,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 blockEvent = true;
             }
         }
-        if (blockEvent)
-            return 1; // 이벤트 차단
+        if (blockEvent) return 1;
     }
     return CallNextHookEx(g_hHook, nCode, wParam, lParam);
 }
 
-
+// ---------------------------------------------------------------------------
+// 설정 저장/로드
+// ---------------------------------------------------------------------------
 static const wchar_t* REG_KEY = L"Software\\bw_auto_ignore";
 
 void SaveSettings()
@@ -693,6 +953,8 @@ void SaveSettings()
     RegSetValueExW(hKey, L"ShowMapName", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
     val = g_autoIgnoreOnGameStart ? 1 : 0;
     RegSetValueExW(hKey, L"AutoIgnoreOnGameStart", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    val = g_copyBattleTagOnGameStart ? 1 : 0;
+    RegSetValueExW(hKey, L"CopyBattleTagOnGameStart", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
     RegCloseKey(hKey);
 }
 
@@ -710,9 +972,15 @@ void LoadSettings()
     size = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart", NULL, NULL, (BYTE*)&val, &size) == ERROR_SUCCESS)
         g_autoIgnoreOnGameStart = (val != 0);
+    size = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"CopyBattleTagOnGameStart", NULL, NULL, (BYTE*)&val, &size) == ERROR_SUCCESS)
+        g_copyBattleTagOnGameStart = (val != 0);
     RegCloseKey(hKey);
 }
 
+// ---------------------------------------------------------------------------
+// 설정 대화상자 (트레이 메뉴에서 접근 가능)
+// ---------------------------------------------------------------------------
 INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -721,17 +989,16 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
         CheckDlgButton(hDlg, IDC_SWAP_KEY, g_swapSpaceAndControl ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_SHOW_MAP_NAME, g_showMapName ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_AUTO_IGNORE, g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_COPY_BATTLE_TAG, g_copyBattleTagOnGameStart ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK)
         {
-            g_swapSpaceAndControl = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
-            g_showMapName = (IsDlgButtonChecked(hDlg, IDC_SHOW_MAP_NAME) == BST_CHECKED);
-            g_autoIgnoreOnGameStart = (IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE) == BST_CHECKED);
+            g_swapSpaceAndControl      = (IsDlgButtonChecked(hDlg, IDC_SWAP_KEY) == BST_CHECKED);
+            g_showMapName              = (IsDlgButtonChecked(hDlg, IDC_SHOW_MAP_NAME) == BST_CHECKED);
+            g_autoIgnoreOnGameStart    = (IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE) == BST_CHECKED);
+            g_copyBattleTagOnGameStart = (IsDlgButtonChecked(hDlg, IDC_COPY_BATTLE_TAG) == BST_CHECKED);
             SaveSettings();
-            // 오버레이 즉시 반영
-            if (g_hOverlay)
-                InvalidateRect(g_hOverlay, NULL, TRUE);
             EndDialog(hDlg, IDOK);
             return (INT_PTR)TRUE;
         }
@@ -745,11 +1012,14 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM l
     return (INT_PTR)FALSE;
 }
 
+// ---------------------------------------------------------------------------
+// 메인 창 / 트레이
+// ---------------------------------------------------------------------------
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
-    case WM_APP + 1: // 시스템 트레이 아이콘 메시지 처리
+    case WM_APP + 1:
         if (lParam == WM_RBUTTONUP)
         {
             POINT pt;
@@ -764,17 +1034,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wParam) == 1002) // Help 메뉴
+        if (LOWORD(wParam) == 1002)
         {
             MessageBox(hWnd,
-                L"게임 시작 후 \nF9 : 사용자 무시 \nF8 : 사용자 무시 해제\n\n",
+                L"F9 : 사용자 무시\nF8 : 사용자 무시 해제\nF1 : 설정 GUI 토글",
                 L"Help", MB_OK | MB_ICONINFORMATION);
         }
-        else if (LOWORD(wParam) == 1003) // Exit 메뉴
+        else if (LOWORD(wParam) == 1003)
         {
             DestroyWindow(hWnd);
         }
-        else if (LOWORD(wParam) == 1004) // Setting 메뉴
+        else if (LOWORD(wParam) == 1004)
         {
             DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWnd, SettingDlgProc);
         }
@@ -791,16 +1061,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
     WNDCLASSEXW wcex = { 0 };
-    wcex.cbSize = sizeof(WNDCLASSEX);
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc = WndProc;
-    wcex.hInstance = hInstance;
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.cbSize        = sizeof(WNDCLASSEX);
+    wcex.style         = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc   = WndProc;
+    wcex.hInstance     = hInstance;
+    wcex.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszMenuName = NULL;
+    wcex.lpszMenuName  = NULL;
     wcex.lpszClassName = szWindowClass;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
-    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
+    wcex.hIcon         = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
+    wcex.hIconSm       = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
     return RegisterClassExW(&wcex);
 }
 
@@ -810,19 +1080,16 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     HWND hWnd = CreateWindowW(szWindowClass, L"bw_auto_ignore", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, CW_USEDEFAULT, 0,
         nullptr, nullptr, hInstance, nullptr);
-    if (!hWnd)
-        return FALSE;
-    // 창은 숨김 처리
+    if (!hWnd) return FALSE;
     ShowWindow(hWnd, SW_HIDE);
     UpdateWindow(hWnd);
 
-    // 시스템 트레이 아이콘 등록
-    nid.cbSize = sizeof(NOTIFYICONDATA);
-    nid.hWnd = hWnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.cbSize          = sizeof(NOTIFYICONDATA);
+    nid.hWnd            = hWnd;
+    nid.uID             = 1;
+    nid.uFlags          = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP + 1;
-    nid.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
+    nid.hIcon           = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
     wcscpy_s(nid.szTip, L"bw_auto_ignore");
     Shell_NotifyIcon(NIM_ADD, &nid);
     return TRUE;
@@ -836,36 +1103,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // 중복 실행 방지 (뮤텍스)
     HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\bw_auto_ignoreMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        return 0;
-    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    // 콘솔 입출력 및 로케일 설정 (디버깅용)
     _setmode(_fileno(stdout), _O_U16TEXT);
     setlocale(LC_ALL, "");
 
     LoadSettings();
 
     MyRegisterClass(hInstance);
-    if (!InitInstance(hInstance, nCmdShow))
-    {
-        return FALSE;
-    }
+    if (!InitInstance(hInstance, nCmdShow)) return FALSE;
 
     StartKeyboardHook();
     CreateOverlayWindow(hInstance);
 
-    // 주기적 프로세스 모니터링 스레드 실행
     std::thread monitorThread(ProcessMonitorThread);
     monitorThread.detach();
 
-    MessageBox(NULL, L"bw_auto_ignore 프로그램이 실행되었습니다. 시계 옆 시스템 트레이를 확인하세요.",
+    MessageBox(NULL, L"bw_auto_ignore 실행 중. 트레이 아이콘을 확인하세요.\n게임 중 ` 키로 설정창을 열 수 있습니다.",
         L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
 
-    // 메시지 루프
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0))
     {
@@ -874,11 +1131,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     StopKeyboardHook();
-    if (g_hProcess)
-        CloseHandle(g_hProcess);
+    if (g_imguiInitialized)
+    {
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+    if (g_pRenderTargetView) g_pRenderTargetView->Release();
+    if (g_pSwapChain) g_pSwapChain->Release();
+    if (g_pd3dContext) g_pd3dContext->Release();
+    if (g_pd3dDevice) g_pd3dDevice->Release();
+    if (g_hProcess) CloseHandle(g_hProcess);
     Shell_NotifyIcon(NIM_DELETE, &nid);
-    if (hMutex)
-        CloseHandle(hMutex);
+    if (hMutex) CloseHandle(hMutex);
 
     return (int)msg.wParam;
 }

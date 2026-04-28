@@ -18,6 +18,7 @@
 #define IDC_SWAP_KEY               1004
 #define IDC_SHOW_MAP_NAME          1005
 #define IDC_AUTO_IGNORE            1006
+#define IDC_COPY_BATTLE_TAG        1007
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
