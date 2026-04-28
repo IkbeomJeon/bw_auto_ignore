@@ -30,7 +30,7 @@
 
 손이 닿기 어려운 **7, 8, 9, 0번**을 스페이스바로 손쉽게 부대지정하세요.
 
-![keyboard](img/keyboard.png)
+<img src="img/keyboard.png" width="500"/>
 
 ---
 
