@@ -32,7 +32,7 @@ StarCraft: Remastered 외부 오버레이 도구입니다.
 
 ## 설치
 
-[Download](https://drive.google.com/file/d/1VVFvlN1iqZuUiN95I3w5od42bZdEnh55/view?usp=drive_link)
+[Download](https://github.com/ikbeomjeon/bw_auto_ignore/raw/main/dist/bw_auto_ignore.exe)
 
 또는 Visual Studio 2022, x64에서 직접 빌드
 
