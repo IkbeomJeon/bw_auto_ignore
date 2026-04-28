@@ -88,12 +88,16 @@ bool                    g_showGui           = false;
 // ---------------------------------------------------------------------------
 struct ToonStat {
     std::string name;       // 인게임 이름 (UTF-8)
-    int  gateway   = 0;     // 10=USW 11=USE 12=EU 20=Asia 30=KR
-    char cur_tier  = 'U';   // 현재 시즌 티어
-    int  cur_rating = 0;    // 현재 시즌 점수
-    char cur_race  = 'U';   // 현재 시즌 주력 종족 Z/T/P/U
-    char best_tier = 'U';   // 역대 최고 티어
-    int  best_rating = 0;   // 역대 최고 점수
+    int  gateway    = 0;    // 10=USW 11=USE 12=EU 20=Asia 30=KR
+    char cur_tier   = 'U'; // 현재 시즌 티어
+    int  cur_rating = 0;   // 현재 시즌 점수
+    int  cur_season = 0;   // 현재 시즌 번호
+    char cur_race   = 'U'; // 현재 시즌 주력 종족 Z/T/P/U
+    char best_tier  = 'U'; // 역대 최고 티어
+    int  best_rating = 0;  // 역대 최고 점수
+    int  best_season = 0;  // 역대 최고 달성 시즌 번호
+    int  win_streak  = 0;  // 현재 연승
+    int  loss_streak = 0;  // 현재 연패
 };
 
 struct DisplayProfile {
@@ -375,11 +379,11 @@ static WORD FindLocalWebApiPort() {
     return 0;
 }
 
-static std::string LocalWebApiGet(const std::string& name, WORD port) {
+static std::string LocalWebApiGet(const std::string& name, WORD port, int gateway = 30) {
     int wl = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), (int)name.size(), NULL, 0);
     std::wstring wn(wl, 0);
     MultiByteToWideChar(CP_UTF8, 0, name.c_str(), (int)name.size(), &wn[0], wl);
-    std::wstring path = L"/web-api/v2/aurora-profile-by-toon/" + wn + L"/30?request_flags=scr_tooninfo";
+    std::wstring path = L"/web-api/v2/aurora-profile-by-toon/" + wn + L"/" + std::to_wstring(gateway) + L"?request_flags=scr_tooninfo";
 
     HINTERNET hS = WinHttpOpen(L"StarCraft/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -417,7 +421,16 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
     }
     if (!port) { result.statusMsg = "StarCraft not running"; return result; }
 
-    std::string json = LocalWebApiGet(queryName, port);
+    // 모든 게이트웨이 순서대로 시도 (KR=30, Asia=20, USW=10, USE=11, EU=12)
+    const int gateways[] = { 30, 20, 10, 11, 12 };
+    std::string json;
+    for (int gw : gateways) {
+        std::string gwJson = LocalWebApiGet(queryName, port, gw);
+        if (!gwJson.empty() && !JsonStringVal(gwJson, "battle_tag").empty()) {
+            json = gwJson;
+            break;
+        }
+    }
     if (json.empty()) { result.statusMsg = "No response"; return result; }
 
     result.battleTag = JsonStringVal(json, "battle_tag");
@@ -453,6 +466,41 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         if (!name.empty() && guid > 0) guidMap[guid] = {name, gw};
     });
 
+    // toon_guid_by_gateway 에서 guid→gateway 보완 (toons[]에 없는 경우 대비)
+    // 구조: {"30": {"toon_name": guid, ...}, ...}
+    {
+        const int knownGws[] = {10, 11, 12, 20, 30};
+        for (int gw : knownGws) {
+            std::string gwKey = "\"" + std::to_string(gw) + "\"";
+            size_t gwPos = json.find("\"toon_guid_by_gateway\"");
+            if (gwPos == std::string::npos) break;
+            size_t blockStart = json.find('{', gwPos);
+            if (blockStart == std::string::npos) break;
+            size_t blockEnd = FindMatchingBrace(json, blockStart);
+            std::string block = json.substr(blockStart, blockEnd - blockStart + 1);
+            size_t kp = block.find(gwKey);
+            if (kp == std::string::npos) continue;
+            size_t ob = block.find('{', kp);
+            if (ob == std::string::npos) continue;
+            size_t oe = FindMatchingBrace(block, ob);
+            std::string inner = block.substr(ob + 1, oe - ob - 1);
+            // 각 "name": guid 파싱
+            size_t p = 0;
+            while (p < inner.size()) {
+                size_t qs = inner.find('"', p); if (qs == std::string::npos) break;
+                size_t qe = inner.find('"', qs + 1); if (qe == std::string::npos) break;
+                std::string tname = inner.substr(qs + 1, qe - qs - 1);
+                size_t cp = inner.find(':', qe); if (cp == std::string::npos) break;
+                int guid = atoi(inner.c_str() + cp + 1);
+                if (!tname.empty() && guid > 0 && guidMap.find(guid) == guidMap.end())
+                    guidMap[guid] = {tname, gw};
+                p = cp + 1;
+                size_t comma = inner.find(',', p);
+                p = (comma != std::string::npos) ? comma + 1 : inner.size();
+            }
+        }
+    }
+
     // 2. stats[] 파싱 → (name,gateway)→종족 맵
     std::map<std::pair<std::string,int>, char> raceMap;
     parseArray("stats", [&](const std::string& obj) {
@@ -472,7 +520,7 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
     });
 
     // 3. matchmaked_stats[] 파싱
-    struct StatEntry { int season_id, bucket, rating; };
+    struct StatEntry { int season_id, bucket, rating, win_streak, loss_streak; };
     std::map<std::pair<std::string,int>, std::vector<StatEntry>> allStats;
 
     parseArray("matchmaked_stats", [&](const std::string& obj) {
@@ -481,11 +529,13 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         int sid   = JsonIntVal(obj, "season_id");
         int bkt   = JsonIntVal(obj, "bucket");
         int rat   = JsonIntVal(obj, "rating");
+        int ws    = JsonIntVal(obj, "win_streak");
+        int ls    = JsonIntVal(obj, "loss_streak");
         if (name.empty()) return;
         int gw = 0;
         auto it = guidMap.find(guid);
         if (it != guidMap.end()) gw = it->second.gateway;
-        allStats[{name, gw}].push_back({sid, bkt, rat});
+        allStats[{name, gw}].push_back({sid, bkt, rat, ws, ls});
     });
 
     // 4. ToonStat 빌드
@@ -500,8 +550,11 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         for (auto& e : entries) maxSid = std::max(maxSid, e.season_id);
         for (auto& e : entries) {
             if (e.season_id == maxSid) {
-                stat.cur_tier   = BucketToTier(e.bucket);
-                stat.cur_rating = e.rating;
+                stat.cur_tier    = BucketToTier(e.bucket);
+                stat.cur_rating  = e.rating;
+                stat.cur_season  = e.season_id;
+                stat.win_streak  = e.win_streak;
+                stat.loss_streak = e.loss_streak;
                 break;
             }
         }
@@ -511,6 +564,7 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
                 maxBkt = e.bucket;
                 stat.best_tier   = BucketToTier(e.bucket);
                 stat.best_rating = e.rating;
+                stat.best_season = e.season_id;
             }
         }
         result.toons.push_back(stat);
@@ -575,33 +629,6 @@ static void RenderOverlay()
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // 맵 이름 표시 (인게임 + 설정 ON)
-    if (g_showMapName && !g_mapName.empty() && g_isInGame)
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 8.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 8.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-        ImGui::SetNextWindowBgAlpha(0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::Begin("##map", nullptr,
-            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoBackground);
-        std::string utf8(g_mapName.size()*3+1, 0);
-        WideCharToMultiByte(CP_UTF8, 0, g_mapName.c_str(), -1, &utf8[0], (int)utf8.size(), NULL, NULL);
-        ImGui::SetWindowFontScale(1.4f);
-        ImVec2 pos = ImGui::GetCursorScreenPos();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        for (int dx = -1; dx <= 1; dx++)
-            for (int dy = -1; dy <= 1; dy++)
-                if (dx || dy)
-                    dl->AddText(ImVec2(pos.x+dx, pos.y+dy), IM_COL32(0,0,0,255), utf8.c_str());
-        ImGui::TextColored(ImVec4(1,1,1,1), "%s", utf8.c_str());
-        ImGui::End();
-        ImGui::PopStyleVar();
-    }
-
     // 설정 GUI
     if (g_showGui)
     {
@@ -610,6 +637,16 @@ static void RenderOverlay()
         ImGui::Begin(u8"bw_auto_ignore", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
+
+        // 맵 이름 (인게임 + 설정 ON)
+        if (g_showMapName && !g_mapName.empty() && g_isInGame) {
+            std::string utf8(g_mapName.size()*3+1, 0);
+            WideCharToMultiByte(CP_UTF8, 0, g_mapName.c_str(), -1, &utf8[0], (int)utf8.size(), NULL, NULL);
+            ImGui::SetWindowFontScale(1.3f);
+            ImGui::TextColored(ImVec4(1,1,0.4f,1), u8"맵: %s", utf8.c_str());
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::Separator();
+        }
 
         // ============================================================
         // 전적 조회
@@ -622,27 +659,35 @@ static void RenderOverlay()
                     ImGui::TextDisabled("%s", prof.statusMsg.c_str());
                 if (!prof.valid) return;
                 ImGui::TextColored(ImVec4(1,0.85f,0,1), u8"배틀태그: %s#", prof.battleTag.c_str());
-                if (ImGui::BeginTable("##toons", 5,
+                if (ImGui::BeginTable("##toons", 6,
                     ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg))
                 {
-                    ImGui::TableSetupColumn("GW",        ImGuiTableColumnFlags_WidthFixed, 38);
-                    ImGui::TableSetupColumn(u8"아이디",   ImGuiTableColumnFlags_WidthFixed, 130);
-                    ImGui::TableSetupColumn(u8"현재",     ImGuiTableColumnFlags_WidthFixed, 75);
-                    ImGui::TableSetupColumn(u8"종족",     ImGuiTableColumnFlags_WidthFixed, 28);
-                    ImGui::TableSetupColumn(u8"역대최고",  ImGuiTableColumnFlags_WidthFixed, 80);
+                    ImGui::TableSetupColumn("GW",          ImGuiTableColumnFlags_WidthFixed, 32);
+                    ImGui::TableSetupColumn(u8"아이디",     ImGuiTableColumnFlags_WidthFixed, 120);
+                    ImGui::TableSetupColumn(u8"현재 시즌",  ImGuiTableColumnFlags_WidthFixed, 78);
+                    ImGui::TableSetupColumn(u8"종족",       ImGuiTableColumnFlags_WidthFixed, 24);
+                    ImGui::TableSetupColumn(u8"역대 최고",  ImGuiTableColumnFlags_WidthFixed, 78);
+                    ImGui::TableSetupColumn(u8"연속",       ImGuiTableColumnFlags_WidthFixed, 48);
                     ImGui::TableHeadersRow();
                     for (auto& t : prof.toons) {
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", GatewayName(t.gateway));
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%s", t.name.c_str());
                         ImGui::TableSetColumnIndex(2);
-                        if (t.cur_tier != 'U') ImGui::TextColored(TierColor(t.cur_tier), "%c  %4d", t.cur_tier, t.cur_rating);
+                        if (t.cur_tier != 'U') ImGui::TextColored(TierColor(t.cur_tier), "%c %4d S%d", t.cur_tier, t.cur_rating, t.cur_season);
                         else ImGui::TextDisabled(u8"미배치");
                         ImGui::TableSetColumnIndex(3);
                         char rc = t.cur_race; ImGui::Text("%c", (rc == 'U') ? '-' : rc);
                         ImGui::TableSetColumnIndex(4);
-                        if (t.best_tier != 'U') ImGui::TextColored(TierColor(t.best_tier), "%c  %4d", t.best_tier, t.best_rating);
+                        if (t.best_tier != 'U') ImGui::TextColored(TierColor(t.best_tier), "%c %4d S%d", t.best_tier, t.best_rating, t.best_season);
                         else ImGui::TextDisabled("-");
+                        ImGui::TableSetColumnIndex(5);
+                        if (t.win_streak > 0)
+                            ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), u8"%d연승", t.win_streak);
+                        else if (t.loss_streak > 0)
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), u8"%d연패", t.loss_streak);
+                        else
+                            ImGui::TextDisabled("-");
                     }
                     ImGui::EndTable();
                 }
@@ -663,25 +708,6 @@ static void RenderOverlay()
 
         } // 전적 조회
 
-        // ============================================================
-        // 설정
-        // ============================================================
-        ImGui::SeparatorText(u8"설정");
-        {
-            bool v;
-            v = g_swapSpaceAndControl;
-            if (ImGui::Checkbox(u8"스페이스바를 컨트롤 키로 이용하기", &v))
-            { g_swapSpaceAndControl = v; SaveSettings(); }
-
-            v = g_showMapName;
-            if (ImGui::Checkbox(u8"맵 이름 표시", &v))
-            { g_showMapName = v; SaveSettings(); }
-
-            v = g_autoIgnoreOnGameStart;
-            if (ImGui::Checkbox(u8"게임 시작 시 채팅 자동 무시", &v))
-            { g_autoIgnoreOnGameStart = v; SaveSettings(); }
-        }
-
         ImGui::End();
     } // g_showGui
 
@@ -689,32 +715,26 @@ static void RenderOverlay()
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     g_pSwapChain->Present(0, 0);
 
-    // 실제 렌더된 영역만 클릭 영역으로 설정 (변경 시에만)
+    // GUI 영역만 윈도우 리전으로 설정 (변경 시에만)
+    // - 리전 밖: 윈도우가 존재하지 않음 → SC가 마우스/커서 직접 처리
+    // - 리전 안: HTTRANSPARENT → SC로 전달 (인터랙티브 요소 없으므로 문제없음)
     {
-        static RECT lastRgn = {-2,-2,-2,-2};
+        static RECT s_lastRgn = {-2,-2,-2,-2};
         RECT newRgn = {0,0,0,0};
 
-        if (g_showMapName && g_isInGame) {
-            ImGuiWindow* w = ImGui::FindWindowByName("##map");
-            if (w) {
-                newRgn.left   = std::min(newRgn.left,   (LONG)(w->Pos.x)-4);
-                newRgn.top    = std::min(newRgn.top,    (LONG)(w->Pos.y)-4);
-                newRgn.right  = std::max(newRgn.right,  (LONG)(w->Pos.x+w->Size.x)+4);
-                newRgn.bottom = std::max(newRgn.bottom, (LONG)(w->Pos.y+w->Size.y)+4);
-            }
-        }
         if (g_showGui) {
             ImGuiWindow* w = ImGui::FindWindowByName(u8"bw_auto_ignore");
-            if (w) {
-                newRgn.left   = std::min(newRgn.left,   (LONG)w->Pos.x);
-                newRgn.top    = std::min(newRgn.top,    (LONG)w->Pos.y);
-                newRgn.right  = std::max(newRgn.right,  (LONG)(w->Pos.x+w->Size.x));
-                newRgn.bottom = std::max(newRgn.bottom, (LONG)(w->Pos.y+w->Size.y));
+            if (w && w->Size.x > 0) {
+                newRgn.left   = (LONG)w->Pos.x;
+                newRgn.top    = (LONG)w->Pos.y;
+                newRgn.right  = (LONG)(w->Pos.x + w->Size.x);
+                newRgn.bottom = (LONG)(w->Pos.y + w->Size.y);
             }
         }
+        // g_showGui==false 또는 창 없으면 newRgn={0,0,0,0} → 빈 리전
 
-        if (memcmp(&newRgn, &lastRgn, sizeof(RECT)) != 0) {
-            lastRgn = newRgn;
+        if (memcmp(&newRgn, &s_lastRgn, sizeof(RECT)) != 0) {
+            s_lastRgn = newRgn;
             HRGN rgn = CreateRectRgn(newRgn.left, newRgn.top, newRgn.right, newRgn.bottom);
             SetWindowRgn(g_hOverlay, rgn, FALSE);
         }
@@ -726,12 +746,10 @@ static void RenderOverlay()
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (g_imguiInitialized && g_showGui)
-        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-            return 1;
-
     switch (msg)
     {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;  // 마우스 입력 항상 게임으로 통과
     case WM_SIZE:
         if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
             CleanupRenderTarget();
@@ -751,6 +769,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_autoFetching = true;
             }
             std::thread(AutoFetchOpponents).detach();
+            // 홍보 메시지 (비활성화)
+            // std::thread([](){
+            //     Sleep(2000);
+            //     SendToStarCraft(u8"[bw_auto_ignore] 상대방 전적 자동 조회 + 채팅 무시 프로그램 사용 중");
+            // }).detach();
         }
         if (!g_wasInGame && inGame && g_autoIgnoreOnGameStart) {
             std::thread t(DoExtraction); t.detach();
@@ -823,6 +846,7 @@ void CreateOverlayWindow(HINSTANCE hInstance)
     g_imguiInitialized = true;
 
     SetTimer(g_hOverlay, 1, 200, NULL);
+    SetWindowRgn(g_hOverlay, CreateRectRgn(0,0,0,0), FALSE); // 빈 리전으로 시작
     UpdateOverlayPosition();
 }
 
@@ -875,14 +899,6 @@ std::vector<ULONGLONG> FindAllPrefixAddresses(HANDLE hProcess, const char* prefi
     return addrs;
 }
 
-void SendUnicodeString(const std::wstring& s) {
-    for (wchar_t ch : s) {
-        INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.dwFlags = KEYEVENTF_UNICODE; in.ki.wScan = ch;
-        SendInput(1, &in, sizeof(in));
-        in.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(1, &in, sizeof(in));
-    }
-}
 void SendVirtualKey(WORD vk) {
     INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = vk;
     SendInput(1, &in, sizeof(in));
@@ -890,10 +906,32 @@ void SendVirtualKey(WORD vk) {
     SendInput(1, &in, sizeof(in));
 }
 void SendToStarCraft(std::string cmd) {
-    SendVirtualKey(VK_RETURN);
     int n = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, NULL, 0);
-    std::wstring wc(n, 0); MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wc[0], n);
-    SendUnicodeString(wc); SendVirtualKey(VK_RETURN);
+    std::wstring wc(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wc[0], n);
+
+    // Enter + 모든 글자 + Enter 를 단일 SendInput 배치로 전송
+    std::vector<INPUT> inputs;
+    auto pushVK = [&](WORD vk, bool up) {
+        INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = vk;
+        if (up) in.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs.push_back(in);
+    };
+    auto pushChar = [&](wchar_t ch) {
+        INPUT in = {}; in.type = INPUT_KEYBOARD;
+        in.ki.dwFlags = KEYEVENTF_UNICODE; in.ki.wScan = ch;
+        inputs.push_back(in);
+        in.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(in);
+    };
+
+    pushVK(VK_RETURN, false);
+    pushVK(VK_RETURN, true);
+    for (wchar_t ch : wc) if (ch) pushChar(ch);
+    pushVK(VK_RETURN, false);
+    pushVK(VK_RETURN, true);
+
+    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
 std::set<std::string> ExtractStrings(const char* prefix, size_t plen, char tail) {
@@ -958,19 +996,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
             // F1: GUI 토글
-            if (kb->vkCode == VK_F1 && (scFg || ovFg) && g_hOverlay)
+            if (kb->vkCode == VK_F12 && (scFg || ovFg) && g_hOverlay)
             {
                 g_showGui = !g_showGui;
-                LONG_PTR ex = GetWindowLongPtr(g_hOverlay, GWL_EXSTYLE);
-                if (g_showGui) {
-                    SetWindowLongPtr(g_hOverlay, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
-                    SetTimer(g_hOverlay, 1, 33, NULL);
-                    UpdateOverlayPosition();
-                } else {
-                    SetWindowLongPtr(g_hOverlay, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
-                    SetTimer(g_hOverlay, 1, 200, NULL);
-                    UpdateOverlayPosition();
-                }
+                SetTimer(g_hOverlay, 1, g_showGui ? 33 : 200, NULL);
+                UpdateOverlayPosition();
                 RenderOverlay();
                 return 1;
             }
@@ -1110,7 +1140,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     std::thread(ProcessMonitorThread).detach();
 
-    MessageBox(NULL, L"bw_auto_ignore running.\nF1: settings GUI  F9: ignore  F8: unignore",
+    MessageBox(NULL,
+        L"bw_auto_ignore running.\nF12: 전적 GUI  F9: 무시  F8: 무시 해제\n\n세부 설정은 시스템 트레이 아이콘을 우클릭하세요.",
         L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
 
     MSG msg;
