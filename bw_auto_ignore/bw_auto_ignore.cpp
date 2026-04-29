@@ -816,6 +816,10 @@ void CreateOverlayWindow(HINSTANCE hInstance)
         L"BW_OverlayWndClass", L"", WS_POPUP,
         0, 0, sw, sh, NULL, NULL, hInstance, NULL);
 
+    HICON hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
+    SendMessage(g_hOverlay, WM_SETICON, ICON_BIG,   (LPARAM)hIcon);
+    SendMessage(g_hOverlay, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+
     // DWM 퍼픽셀 알파: 전체 클라이언트 영역에 적용
     MARGINS m = { -1, -1, -1, -1 };
     DwmExtendFrameIntoClientArea(g_hOverlay, &m);
