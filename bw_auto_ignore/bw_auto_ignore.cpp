@@ -231,9 +231,10 @@ HWND GetStarCraftWindow() {
 void UpdateOverlayPosition()
 {
     if (!g_hOverlay) return;
-    HWND hSC = GetStarCraftWindow();
-    g_hStarCraftWnd = hSC;
-    if (!hSC || !IsWindow(hSC)) { ShowWindow(g_hOverlay, SW_HIDE); return; }
+    if (!g_hStarCraftWnd || !IsWindow(g_hStarCraftWnd))
+        g_hStarCraftWnd = GetStarCraftWindow();
+    HWND hSC = g_hStarCraftWnd;
+    if (!hSC) { ShowWindow(g_hOverlay, SW_HIDE); return; }
 
     HWND hFg = GetForegroundWindow();
     bool scOrOverlayFg = (hFg == hSC || hFg == g_hOverlay);
@@ -1005,7 +1006,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (kb->vkCode == VK_F12 && (scFg || ovFg) && g_hOverlay)
             {
                 g_showGui = !g_showGui;
-                SetTimer(g_hOverlay, 1, g_showGui ? 33 : 200, NULL);
                 UpdateOverlayPosition();
                 RenderOverlay();
                 return 1;
