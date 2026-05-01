@@ -20,6 +20,7 @@
 #define IDC_AUTO_IGNORE            1006
 #define IDC_COPY_BATTLE_TAG        1007
 #define IDC_FAST_JOIN              1008
+#define IDC_WHISPER_REPLY          1009
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1

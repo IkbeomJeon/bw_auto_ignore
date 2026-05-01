@@ -48,7 +48,9 @@ const ULONGLONG MAP_NAME_OFFSET    = 0x1091FEE;
 const ULONGLONG IS_IN_GAME_OFFSET  = 0x1090612;
 const ULONGLONG LOBBY_STATE_OFFSET = 0x1091F9C; // 20=로비, 0=그 외
 const ULONGLONG CREATE_MODE_OFFSET = 0x1092011; // 1=방 생성 화면, 0=그 외
-const ULONGLONG CHAT_MODE_OFFSET   = 0x10B6BD8; // 1=채팅 입력 중, 0=그 외
+const ULONGLONG CHAT_MODE_OFFSET      = 0x10B6BD8; // 1=채팅 입력 중, 0=그 외
+const ULONGLONG CHAT_LOG_SCAN_START   = 0x1060000; // 귓말 로그 버퍼 스캔 시작
+const ULONGLONG CHAT_LOG_SCAN_END     = 0x1080000; // 귓말 로그 버퍼 스캔 끝
 
 // ---------------------------------------------------------------------------
 // 전역 변수
@@ -69,6 +71,7 @@ NOTIFYICONDATA nid = { 0 };
 
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
+bool g_whisperReply = false;   // Shift+Enter: 귓말 발신자에게 /w 입력
 bool g_fastJoin = false;      // 공개방 빠른 입장 (현재 비활성)
 bool g_fastJoinActive = false;
 bool g_isInGame = false;
@@ -149,6 +152,9 @@ void UpdateOverlayPosition();
 static void RenderOverlay();
 
 bool IsCreateScreen();
+std::string GetLastWhisperSender();
+void TypeText(const std::string& text);
+void SendWhisperReply();
 void EnableFastJoin();
 void DisableFastJoin();
 
@@ -230,6 +236,80 @@ bool IsChatMode()
     BYTE flag = 0; SIZE_T r = 0;
     ReadProcessMemory(g_hProcess, (LPCVOID)(base + CHAT_MODE_OFFSET), &flag, 1, &r);
     return flag == 1;
+}
+
+// 채팅 로그 버퍼에서 가장 최근 귓말 발신자 추출 (이름> 형태)
+std::string GetLastWhisperSender()
+{
+    ULONGLONG base = GetStarCraftModuleBase();
+    if (!base || !g_hProcess) return "";
+
+    size_t scanSize = CHAT_LOG_SCAN_END - CHAT_LOG_SCAN_START;
+    std::vector<BYTE> buf(scanSize); SIZE_T r = 0;
+    if (!ReadProcessMemory(g_hProcess, (LPCVOID)(base + CHAT_LOG_SCAN_START), buf.data(), scanSize, &r))
+        return "";
+
+    // 가장 마지막에 나타나는 "이름> " 패턴 찾기
+    // 형식: [null bytes] + Name + "> " + message
+    std::string result;
+    for (size_t i = 1; i + 2 < r; i++) {
+        if (buf[i] == '>' && buf[i + 1] == ' ') {
+            // > 앞에서 이름 역추적 (null 또는 비출력 바이트까지)
+            size_t nameEnd = i;
+            size_t nameStart = i;
+            while (nameStart > 0 && buf[nameStart - 1] >= 0x20 && buf[nameStart - 1] < 0x80 && i - nameStart < 64)
+                nameStart--;
+            if (nameStart < nameEnd) {
+                result = std::string((char*)buf.data() + nameStart, nameEnd - nameStart);
+            }
+        }
+    }
+    return result;
+}
+
+// 채팅창에 텍스트만 입력 (전송 없이)
+void TypeText(const std::string& text)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, NULL, 0);
+    std::wstring wc(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wc[0], n);
+
+    std::vector<INPUT> inputs;
+    for (wchar_t ch : wc) {
+        if (!ch) continue;
+        INPUT in = {}; in.type = INPUT_KEYBOARD;
+        in.ki.dwFlags = KEYEVENTF_UNICODE; in.ki.wScan = ch;
+        inputs.push_back(in);
+        in.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(in);
+    }
+    if (!inputs.empty())
+        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+// Shift+Space: 마지막 귓말 발신자에게 /w 입력
+void SendWhisperReply()
+{
+    // Shift 키가 눌린 채로 호출되므로 먼저 릴리즈
+    INPUT shiftUp = {}; shiftUp.type = INPUT_KEYBOARD;
+    shiftUp.ki.wVk = VK_SHIFT; shiftUp.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &shiftUp, sizeof(INPUT));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    std::string sender = GetLastWhisperSender();
+    if (sender.empty()) return;
+
+    std::string cmd = "/w " + sender + " ";
+
+    if (!IsChatMode()) {
+        // 채팅창 열기
+        SendVirtualKey(VK_RETURN);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (!IsChatMode() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!IsChatMode()) return;
+    }
+    TypeText(cmd);
 }
 
 bool IsCreateScreen()
@@ -1118,6 +1198,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (scFg) {
                 if (kb->vkCode == KEY_IGNORE)    { std::thread(DoExtraction).detach(); }
                 if (kb->vkCode == KEY_UNIGNORE)  { std::thread(DoRemoval).detach(); }
+                if (g_whisperReply && kb->vkCode == VK_RETURN && (GetKeyState(VK_SHIFT) & 0x8000)) {
+                    std::thread(SendWhisperReply).detach();
+                    return 1;
+                }
             }
             if (scFg && g_swapSpaceAndControl && g_isInGame && !IsChatMode() && kb->vkCode == KEY_ADDITIONAL_CTRL) {
                 INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = VK_CONTROL;
@@ -1146,6 +1230,7 @@ void SaveSettings() {
     DWORD v;
     v = g_swapSpaceAndControl;   RegSetValueExW(hKey, L"SwapSpaceAndControl",   0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_autoIgnoreOnGameStart; RegSetValueExW(hKey, L"AutoIgnoreOnGameStart",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_whisperReply;          RegSetValueExW(hKey, L"WhisperReply",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
 
@@ -1154,7 +1239,8 @@ void LoadSettings() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) return;
     DWORD v, sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"SwapSpaceAndControl",   NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_swapSpaceAndControl   = v != 0; sz = sizeof(DWORD);
-    if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0;
+    if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0;
     RegCloseKey(hKey);
 }
 
@@ -1162,13 +1248,15 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_INITDIALOG:
-        CheckDlgButton(hDlg, IDC_SWAP_KEY,    g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_IGNORE, g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_SWAP_KEY,      g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,   g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WHISPER_REPLY, g_whisperReply          ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
-            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)    == BST_CHECKED;
-            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE) == BST_CHECKED;
+            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)       == BST_CHECKED;
+            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)    == BST_CHECKED;
+            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)  == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }
