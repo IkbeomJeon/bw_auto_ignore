@@ -19,6 +19,7 @@
 #define IDC_SHOW_MAP_NAME          1005
 #define IDC_AUTO_IGNORE            1006
 #define IDC_COPY_BATTLE_TAG        1007
+#define IDC_FAST_JOIN              1008
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1

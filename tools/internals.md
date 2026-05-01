@@ -24,6 +24,8 @@ HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE
 | 플레이어 테이블 | `0x10931B0` | 구조체 배열 | 슬롯 8개 × 104바이트 |
 | 인게임 여부 | `0x1090612` | BYTE | 1=인게임, 0=아님 |
 | 맵 이름 | `0x1091FEE` | UTF-8 문자열 | null 종료 |
+| 로비 상태 | `0x1091F9C` | BYTE | 20=로비(채널), 0=그 외 |
+| 방 생성 화면 | `0x1092011` | BYTE | 1=방 생성 화면, 0=그 외 |
 
 ### 플레이어 슬롯 구조 (104바이트)
 ```

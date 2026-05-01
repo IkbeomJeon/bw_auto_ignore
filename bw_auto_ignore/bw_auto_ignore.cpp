@@ -31,6 +31,8 @@
 #include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include <shlobj.h>
+#pragma comment(lib, "shell32.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -42,8 +44,11 @@ const int PLAYER_SLOT_SIZE  = 104;
 const int PLAYER_SLOT_COUNT = 8;
 const int PLAYER_NAME_OFFSET = 8;
 
-const ULONGLONG MAP_NAME_OFFSET   = 0x1091FEE;
-const ULONGLONG IS_IN_GAME_OFFSET = 0x1090612;
+const ULONGLONG MAP_NAME_OFFSET    = 0x1091FEE;
+const ULONGLONG IS_IN_GAME_OFFSET  = 0x1090612;
+const ULONGLONG LOBBY_STATE_OFFSET = 0x1091F9C; // 20=로비, 0=그 외
+const ULONGLONG CREATE_MODE_OFFSET = 0x1092011; // 1=방 생성 화면, 0=그 외
+const ULONGLONG CHAT_MODE_OFFSET   = 0x10B6BD8; // 1=채팅 입력 중, 0=그 외
 
 // ---------------------------------------------------------------------------
 // 전역 변수
@@ -62,10 +67,10 @@ HINSTANCE hInst;
 WCHAR szWindowClass[] = L"BW_AutoIgnoreWndClass";
 NOTIFYICONDATA nid = { 0 };
 
-bool g_swapSpaceAndControl = true;
-bool g_chatMode = false;
-bool g_showMapName = true;
+bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
+bool g_fastJoin = false;      // 공개방 빠른 입장 (현재 비활성)
+bool g_fastJoinActive = false;
 bool g_isInGame = false;
 bool g_wasInGame = false;
 ULONGLONG g_scModuleBase = 0;
@@ -143,6 +148,10 @@ void SaveSettings();
 void UpdateOverlayPosition();
 static void RenderOverlay();
 
+bool IsCreateScreen();
+void EnableFastJoin();
+void DisableFastJoin();
+
 void StartKeyboardHook();
 void StopKeyboardHook();
 
@@ -212,6 +221,88 @@ bool IsInGame()
     BYTE flag = 0; SIZE_T r = 0;
     ReadProcessMemory(g_hProcess, (LPCVOID)(base + IS_IN_GAME_OFFSET), &flag, 1, &r);
     return flag == 1;
+}
+
+bool IsChatMode()
+{
+    ULONGLONG base = GetStarCraftModuleBase();
+    if (!base || !g_hProcess) return false;
+    BYTE flag = 0; SIZE_T r = 0;
+    ReadProcessMemory(g_hProcess, (LPCVOID)(base + CHAT_MODE_OFFSET), &flag, 1, &r);
+    return flag == 1;
+}
+
+bool IsCreateScreen()
+{
+    ULONGLONG base = GetStarCraftModuleBase();
+    if (!base || !g_hProcess) return false;
+    BYTE v = 0; SIZE_T r = 0;
+    ReadProcessMemory(g_hProcess, (LPCVOID)(base + CREATE_MODE_OFFSET), &v, 1, &r);
+    return v == 1;
+}
+
+static std::wstring GetScDataDir()
+{
+    WCHAR docs[MAX_PATH] = {};
+    SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, docs);
+    return std::wstring(docs) + L"\\StarCraft";
+}
+
+static void MergeDir(const std::wstring& srcDir, const std::wstring& dstDir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE hf = FindFirstFileW((srcDir + L"\\*").c_str(), &fd);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        MoveFileW((srcDir + L"\\" + fd.cFileName).c_str(),
+                  (dstDir + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(hf, &fd));
+    FindClose(hf);
+}
+
+void EnableFastJoin()
+{
+    if (g_fastJoinActive) return;
+    std::wstring base  = GetScDataDir();
+    std::wstring maps  = base + L"\\maps";
+    std::wstring dlSrc = maps + L"\\Download";
+    std::wstring dlDst = base + L"\\Download_bwai";
+    if (GetFileAttributesW(dlSrc.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(dlDst.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MoveFileW(dlSrc.c_str(), dlDst.c_str());
+        CreateDirectoryW(dlSrc.c_str(), NULL);
+    }
+    std::wstring rpSrc = maps + L"\\Replay";
+    std::wstring rpDst = base + L"\\Replay_bwai";
+    if (GetFileAttributesW(rpSrc.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(rpDst.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MoveFileW(rpSrc.c_str(), rpDst.c_str());
+        CreateDirectoryW(rpSrc.c_str(), NULL);
+    }
+    g_fastJoinActive = true;
+}
+
+void DisableFastJoin()
+{
+    if (!g_fastJoinActive) return;
+    std::wstring base  = GetScDataDir();
+    std::wstring maps  = base + L"\\maps";
+    std::wstring dlSrc = maps + L"\\Download";
+    std::wstring dlDst = base + L"\\Download_bwai";
+    if (GetFileAttributesW(dlDst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        MergeDir(dlSrc, dlDst);
+        RemoveDirectoryW(dlSrc.c_str());
+        MoveFileW(dlDst.c_str(), dlSrc.c_str());
+    }
+    std::wstring rpSrc = maps + L"\\Replay";
+    std::wstring rpDst = base + L"\\Replay_bwai";
+    if (GetFileAttributesW(rpDst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        MergeDir(rpSrc, rpDst);
+        RemoveDirectoryW(rpSrc.c_str());
+        MoveFileW(rpDst.c_str(), rpSrc.c_str());
+    }
+    g_fastJoinActive = false;
 }
 
 struct EnumData { DWORD pid; HWND hwnd; };
@@ -618,7 +709,7 @@ static void RenderOverlay()
     if (!g_imguiInitialized || !g_pRenderTargetView) return;
 
     // 보여줄 내용이 없으면 Present 건너뜀 (GPU/DWM 부하 제거)
-    bool hasContent = g_showGui || (g_showMapName && !g_mapName.empty() && g_isInGame);
+    bool hasContent = g_showGui || (!g_mapName.empty() && g_isInGame);
     static bool s_lastHasContent = false;
     if (!hasContent && !s_lastHasContent) return;
     s_lastHasContent = hasContent;
@@ -641,8 +732,8 @@ static void RenderOverlay()
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
 
-        // 맵 이름 (인게임 + 설정 ON)
-        if (g_showMapName && !g_mapName.empty() && g_isInGame) {
+        // 맵 이름 (인게임)
+        if (!g_mapName.empty() && g_isInGame) {
             std::string utf8(g_mapName.size()*3+1, 0);
             WideCharToMultiByte(CP_UTF8, 0, g_mapName.c_str(), -1, &utf8[0], (int)utf8.size(), NULL, NULL);
             ImGui::SetWindowFontScale(1.3f);
@@ -787,6 +878,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         g_wasInGame = inGame;
         g_isInGame  = inGame;
+
+        if (g_fastJoin && g_hProcess) {
+            if (IsCreateScreen()) DisableFastJoin();
+            else                  EnableFastJoin();
+        }
         UpdateOverlayPosition();
         std::wstring nm = inGame ? ReadMapName() : L"";
         if (nm != g_mapName) g_mapName = nm;
@@ -988,9 +1084,14 @@ void StopKeyboardHook()  { if (g_hHook) { UnhookWindowsHookEx(g_hHook); g_hHook 
 void UpdateStarCraftProcess() {
     DWORD pid = GetProcessID(L"StarCraft.exe");
     if (pid && pid != g_starcraftPID) {
+        // SC 새로 실행됨
         g_extractedSet.clear(); g_scModuleBase = 0; g_starcraftPID = pid; g_cachedApiPort = 0;
         if (g_hProcess) CloseHandle(g_hProcess);
         g_hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    } else if (!pid && g_starcraftPID) {
+        if (g_fastJoin) DisableFastJoin();
+        g_starcraftPID = 0; g_scModuleBase = 0;
+        if (g_hProcess) { CloseHandle(g_hProcess); g_hProcess = NULL; }
     }
 }
 void ProcessMonitorThread() { while (true) { UpdateStarCraftProcess(); std::this_thread::sleep_for(std::chrono::seconds(3)); } }
@@ -1017,17 +1118,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             if (scFg) {
                 if (kb->vkCode == KEY_IGNORE)    { std::thread(DoExtraction).detach(); }
                 if (kb->vkCode == KEY_UNIGNORE)  { std::thread(DoRemoval).detach(); }
-                if (kb->vkCode == VK_RETURN)     { g_chatMode = !g_chatMode; }
-                if (kb->vkCode == VK_ESCAPE && g_chatMode) { g_chatMode = false; }
             }
-            if (scFg && g_swapSpaceAndControl && g_isInGame && !g_chatMode && kb->vkCode == KEY_ADDITIONAL_CTRL) {
+            if (scFg && g_swapSpaceAndControl && g_isInGame && !IsChatMode() && kb->vkCode == KEY_ADDITIONAL_CTRL) {
                 INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = VK_CONTROL;
                 SendInput(1, &in, sizeof(in)); return 1;
             }
         }
         else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
         {
-            if (scFg && g_swapSpaceAndControl && g_isInGame && !g_chatMode && kb->vkCode == KEY_ADDITIONAL_CTRL) {
+            if (scFg && g_swapSpaceAndControl && g_isInGame && !IsChatMode() && kb->vkCode == KEY_ADDITIONAL_CTRL) {
                 INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = VK_CONTROL;
                 in.ki.dwFlags = KEYEVENTF_KEYUP; SendInput(1, &in, sizeof(in)); return 1;
             }
@@ -1046,7 +1145,6 @@ void SaveSettings() {
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS) return;
     DWORD v;
     v = g_swapSpaceAndControl;   RegSetValueExW(hKey, L"SwapSpaceAndControl",   0, REG_DWORD, (BYTE*)&v, sizeof(v));
-    v = g_showMapName;           RegSetValueExW(hKey, L"ShowMapName",            0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_autoIgnoreOnGameStart; RegSetValueExW(hKey, L"AutoIgnoreOnGameStart",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
@@ -1056,7 +1154,6 @@ void LoadSettings() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) return;
     DWORD v, sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"SwapSpaceAndControl",   NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_swapSpaceAndControl   = v != 0; sz = sizeof(DWORD);
-    if (RegQueryValueExW(hKey, L"ShowMapName",            NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_showMapName            = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0;
     RegCloseKey(hKey);
 }
@@ -1065,15 +1162,13 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_INITDIALOG:
-        CheckDlgButton(hDlg, IDC_SWAP_KEY,      g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_SHOW_MAP_NAME, g_showMapName           ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,   g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_SWAP_KEY,    g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_IGNORE, g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
-            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)      == BST_CHECKED;
-            g_showMapName           = IsDlgButtonChecked(hDlg, IDC_SHOW_MAP_NAME) == BST_CHECKED;
-            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)   == BST_CHECKED;
+            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)    == BST_CHECKED;
+            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE) == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }
@@ -1150,14 +1245,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
 
     std::thread(ProcessMonitorThread).detach();
 
-    MessageBox(NULL,
-        L"bw_auto_ignore running.\nF12: 전적 GUI  F9: 무시  F8: 무시 해제\n\n세부 설정은 시스템 트레이 아이콘을 우클릭하세요.",
-        L"bw_auto_ignore", MB_OK | MB_ICONINFORMATION);
+    DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), nid.hWnd, SettingDlgProc);
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
 
     StopKeyboardHook();
+    DisableFastJoin();
     if (g_imguiInitialized) {
         ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     }

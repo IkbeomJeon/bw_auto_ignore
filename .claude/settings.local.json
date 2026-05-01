@@ -52,7 +52,23 @@
       "WebFetch(domain:blizztrack.com)",
       "WebFetch(domain:www.macupdater.net)",
       "WebFetch(domain:liquipedia.net)",
-      "Bash(gh repo:*)"
+      "Bash(gh repo:*)",
+      "Bash(magick --version)",
+      "Bash(pip install:*)",
+      "Bash(taskkill /f /im explorer.exe)",
+      "Bash(start explorer.exe)",
+      "Bash(taskkill:*)",
+      "Bash(python3:*)",
+      "Bash(.venv\\\\Scripts\\\\python tools\\\\scan_state.py)",
+      "Bash(\".venv/Scripts/python\" tools/scan_state.py)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py save lobby)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py save joinmode)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py compare lobby joinmode)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py save create)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py compare lobby create)",
+      "Bash(\".venv/Scripts/python\" tools/snap.py compare joinmode create)",
+      "Bash(MSBuild bw_auto_ignore.sln /p:Configuration=Release /p:Platform=x64 /t:Build /v:minimal)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" \"C:\\\\wd\\\\bw_auto_ignore\\\\bw_auto_ignore.sln\" /p:Configuration=Release /p:Platform=x64 /t:Build /v:minimal)"
     ]
   }
 }
