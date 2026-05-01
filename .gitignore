@@ -397,4 +397,10 @@ FodyWeavers.xsd
 *.msp
 
 # JetBrains Rider
-*.sln.iml.git-rewrite/
+*.sln.iml
+
+# Project-specific
+.git-rewrite/
+.venv/
+tools/snaps/
+dist/*.lnk
