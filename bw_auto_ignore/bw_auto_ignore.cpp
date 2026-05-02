@@ -71,7 +71,16 @@ NOTIFYICONDATA nid = { 0 };
 
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
+bool g_autoShowStats = false;  // 게임 시작 후 5초간 전적 오버레이 자동 표시
 bool g_whisperReply = false;   // Shift+Enter: 귓말 발신자에게 /w 입력
+
+std::string g_cachedWhisperSender;
+std::mutex  g_whisperMutex;
+
+// 이미 감지한 inbound (sender, content) 쌍 - 새 귓말 감지용
+std::set<std::pair<std::string,std::string>> g_seenInbound;
+bool g_firstWhisperScan = true;
+std::mutex g_senderMutex;
 bool g_fastJoin = false;      // 공개방 빠른 입장 (현재 비활성)
 bool g_fastJoinActive = false;
 bool g_isInGame = false;
@@ -238,33 +247,165 @@ bool IsChatMode()
     return flag == 1;
 }
 
-// 채팅 로그 버퍼에서 가장 최근 귓말 발신자 추출 (이름> 형태)
-std::string GetLastWhisperSender()
+// SC:R 힙 메모리에서 귓말 발신자를 추적한다.
+//
+// 접근법:
+//   1. 모든 committed 페이지에서 whisperInbound/whisperOutbound terminal("}]") 검색
+//   2. 각 terminal 주소에서 앞으로 4KB를 ReadProcessMemory로 직접 읽어
+//      legacyToonName과 content 추출 (페이지 경계 자동 처리)
+//   3. 같은 발신자의 terminal 중 가장 높은 주소를 "살아있는 버퍼"로 선택
+//   4. 이전 스캔과 content 비교 → 바뀐 발신자 = 최근 귓말 상대
+void ScanWhisperSenderFromHeap()
 {
-    ULONGLONG base = GetStarCraftModuleBase();
-    if (!base || !g_hProcess) return "";
+    if (!g_hProcess) return;
 
-    size_t scanSize = CHAT_LOG_SCAN_END - CHAT_LOG_SCAN_START;
-    std::vector<BYTE> buf(scanSize); SIZE_T r = 0;
-    if (!ReadProcessMemory(g_hProcess, (LPCVOID)(base + CHAT_LOG_SCAN_START), buf.data(), scanSize, &r))
-        return "";
+    static const std::string TERM_INBOUND     = "\"type\":\"whisperInbound\"}]";
+    static const std::string TERM_INBOUND_ESC = "\\\"type\\\":\\\"whisperInbound\\\"}]";
+    static const std::string NAME_TAG         = "legacyToonName\":\"";
+    static const std::string NAME_TAG_ESC     = "legacyToonName\\\":\\\"";
+    static const std::string CONTENT_TAG      = "\"content\":\"";
+    static const std::string CONTENT_TAG_ESC  = "\\\"content\\\":\\\"";
 
-    // 가장 마지막에 나타나는 "이름> " 패턴 찾기
-    // 형식: [null bytes] + Name + "> " + message
-    std::string result;
-    for (size_t i = 1; i + 2 < r; i++) {
-        if (buf[i] == '>' && buf[i + 1] == ' ') {
-            // > 앞에서 이름 역추적 (null 또는 비출력 바이트까지)
-            size_t nameEnd = i;
-            size_t nameStart = i;
-            while (nameStart > 0 && buf[nameStart - 1] >= 0x20 && buf[nameStart - 1] < 0x80 && i - nameStart < 64)
-                nameStart--;
-            if (nameStart < nameEnd) {
-                result = std::string((char*)buf.data() + nameStart, nameEnd - nameStart);
+    const SIZE_T BACK = 4096;
+
+    // 이번 스캔에서 발견된 모든 inbound (sender, content, addr)
+    struct InboundEntry { std::string sender; std::string content; ULONG_PTR addr; };
+    std::vector<InboundEntry> found;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR addr = 0;
+
+    while (VirtualQueryEx(g_hProcess, (LPCVOID)addr, &mbi, sizeof(mbi)) == sizeof(mbi))
+    {
+        ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT &&
+            mbi.Type == MEM_PRIVATE &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) &&
+            mbi.RegionSize >= 64 && mbi.RegionSize <= 0x800000)
+        {
+            std::vector<char> buf(mbi.RegionSize);
+            SIZE_T r = 0;
+            if (ReadProcessMemory(g_hProcess, mbi.BaseAddress, buf.data(), mbi.RegionSize, &r) && r > 64)
+            {
+                std::string_view data(buf.data(), r);
+
+                struct TermSpec { const std::string* tag; bool escaped; };
+                TermSpec specs[] = {
+                    {&TERM_INBOUND,     false},
+                    {&TERM_INBOUND_ESC, true },
+                };
+
+                for (auto& spec : specs)
+                {
+                    size_t pos = 0;
+                    while ((pos = data.find(*spec.tag, pos)) != std::string_view::npos)
+                    {
+                        ULONG_PTR absAddr = (ULONG_PTR)mbi.BaseAddress + (ULONG_PTR)pos;
+
+                        std::string_view ctxView;
+                        std::vector<char> ctxExtra;
+                        size_t ctxStart = (pos >= BACK) ? pos - BACK : 0;
+                        ctxView = data.substr(ctxStart, pos - ctxStart);
+                        if (ctxView.size() < BACK && absAddr >= BACK)
+                        {
+                            ULONG_PTR readFrom = absAddr - BACK;
+                            SIZE_T readSize    = (SIZE_T)(absAddr - readFrom);
+                            ctxExtra.resize(readSize);
+                            SIZE_T ctxRead = 0;
+                            if (ReadProcessMemory(g_hProcess, (LPCVOID)readFrom, ctxExtra.data(), readSize, &ctxRead) && ctxRead > 0)
+                                ctxView = std::string_view(ctxExtra.data(), ctxRead);
+                        }
+
+                        const std::string& nameTag    = spec.escaped ? NAME_TAG_ESC    : NAME_TAG;
+                        const std::string& contentTag = spec.escaped ? CONTENT_TAG_ESC : CONTENT_TAG;
+
+                        size_t ni = ctxView.rfind(nameTag);
+                        if (ni == std::string_view::npos) { pos++; continue; }
+                        size_t ns = ni + nameTag.size();
+                        size_t ne = ctxView.find('"', ns);
+                        if (ne == std::string_view::npos || ne == ns || ne - ns >= 64)
+                        { pos++; continue; }
+                        std::string sender(ctxView.substr(ns, ne - ns));
+                        if (!sender.empty() && sender.back() == '\\') sender.pop_back();
+                        if (sender.empty() || sender.size() >= 64) { pos++; continue; }
+
+                        std::string content;
+                        size_t ci = ctxView.rfind(contentTag);
+                        if (ci != std::string_view::npos)
+                        {
+                            size_t cs = ci + contentTag.size();
+                            size_t ce = ctxView.find('"', cs);
+                            if (ce != std::string_view::npos && ce > cs && ce - cs < 256)
+                            {
+                                content = std::string(ctxView.substr(cs, ce - cs));
+                                if (!content.empty() && content.back() == '\\')
+                                    content.pop_back();
+                            }
+                        }
+
+                        found.push_back({sender, content, absAddr});
+                        pos++;
+                    }
+                }
+            }
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
+
+    // 새로 발견된 (sender, content) 쌍 감지
+    std::string latestSender;
+    ULONG_PTR   latestAddr = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_senderMutex);
+
+        if (g_firstWhisperScan)
+        {
+            // 첫 스캔: 기존 귓말을 모두 "이미 봄"으로 등록만 하고
+            // 가장 높은 주소의 발신자를 초기 응답 대상으로 설정
+            g_firstWhisperScan = false;
+            for (auto& e : found)
+            {
+                g_seenInbound.insert({e.sender, e.content});
+                if (e.addr > latestAddr)
+                {
+                    latestAddr    = e.addr;
+                    latestSender  = e.sender;
+                }
+            }
+        }
+        else
+        {
+            // 이후 스캔: g_seenInbound에 없는 새 쌍 = 새 귓말
+            for (auto& e : found)
+            {
+                auto key = std::make_pair(e.sender, e.content);
+                if (g_seenInbound.find(key) == g_seenInbound.end())
+                {
+                    g_seenInbound.insert(key);
+                    // 여러 개 동시 발견 시 addr 큰 것 우선 (최선의 추측)
+                    if (e.addr > latestAddr)
+                    {
+                        latestAddr   = e.addr;
+                        latestSender = e.sender;
+                    }
+                }
             }
         }
     }
-    return result;
+
+    if (!latestSender.empty())
+    {
+        std::lock_guard<std::mutex> lk(g_whisperMutex);
+        g_cachedWhisperSender = latestSender;
+    }
+}
+
+std::string GetLastWhisperSender()
+{
+    std::lock_guard<std::mutex> lk(g_whisperMutex);
+    return g_cachedWhisperSender;
 }
 
 // 채팅창에 텍스트만 입력 (전송 없이)
@@ -274,41 +415,37 @@ void TypeText(const std::string& text)
     std::wstring wc(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wc[0], n);
 
-    std::vector<INPUT> inputs;
     for (wchar_t ch : wc) {
         if (!ch) continue;
-        INPUT in = {}; in.type = INPUT_KEYBOARD;
-        in.ki.dwFlags = KEYEVENTF_UNICODE; in.ki.wScan = ch;
-        inputs.push_back(in);
-        in.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        inputs.push_back(in);
+        INPUT inputs[2] = {};
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[0].ki.wScan = ch;
+        inputs[1] = inputs[0];
+        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, inputs, sizeof(INPUT));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
-    if (!inputs.empty())
-        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
-// Shift+Space: 마지막 귓말 발신자에게 /w 입력
+// Shift+Enter: 마지막 귓말 발신자에게 /w 입력
 void SendWhisperReply()
 {
     // Shift 키가 눌린 채로 호출되므로 먼저 릴리즈
     INPUT shiftUp = {}; shiftUp.type = INPUT_KEYBOARD;
     shiftUp.ki.wVk = VK_SHIFT; shiftUp.ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(1, &shiftUp, sizeof(INPUT));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     std::string sender = GetLastWhisperSender();
     if (sender.empty()) return;
 
     std::string cmd = "/w " + sender + " ";
 
-    if (!IsChatMode()) {
-        // 채팅창 열기
-        SendVirtualKey(VK_RETURN);
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-        while (!IsChatMode() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (!IsChatMode()) return;
-    }
+    // 채팅창 열기 후 고정 딜레이 (IsChatMode 오프셋 의존 제거)
+    SendVirtualKey(VK_RETURN);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
     TypeText(cmd);
 }
 
@@ -596,13 +733,17 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
     // 모든 게이트웨이 순서대로 시도 (KR=30, Asia=20, USW=10, USE=11, EU=12)
     const int gateways[] = { 30, 20, 10, 11, 12 };
     std::string json;
+    std::string fallbackJson; // battle_tag 없어도 응답 온 경우 보관
     for (int gw : gateways) {
         std::string gwJson = LocalWebApiGet(queryName, port, gw);
-        if (!gwJson.empty() && !JsonStringVal(gwJson, "battle_tag").empty()) {
+        if (gwJson.empty()) continue;
+        if (!JsonStringVal(gwJson, "battle_tag").empty()) {
             json = gwJson;
             break;
         }
+        if (fallbackJson.empty()) fallbackJson = gwJson; // 첫 번째 응답 보관
     }
+    if (json.empty()) json = fallbackJson; // battle_tag 없는 응답이라도 사용
     if (json.empty()) { result.statusMsg = "No response"; return result; }
 
     result.battleTag = JsonStringVal(json, "battle_tag");
@@ -776,9 +917,19 @@ static void AutoFetchOpponents()
         else { p.statusMsg = name + ": " + p.statusMsg; results.push_back(p); }
     }
 
-    std::lock_guard<std::mutex> lk(g_profileMutex);
-    g_autoProfiles = results;
-    g_autoFetching = false;
+    {
+        std::lock_guard<std::mutex> lk(g_profileMutex);
+        g_autoProfiles = results;
+        g_autoFetching = false;
+    }
+
+    if (g_autoShowStats && !results.empty()) {
+        g_showGui = true;  // 타이머(WM_TIMER)가 200ms 이내에 렌더링 처리
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            g_showGui = false;
+        }).detach();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,6 +1327,17 @@ void UpdateStarCraftProcess() {
 }
 void ProcessMonitorThread() { while (true) { UpdateStarCraftProcess(); std::this_thread::sleep_for(std::chrono::seconds(3)); } }
 
+void WhisperScanThread()
+{
+    while (true)
+    {
+        // 게임 중엔 귓말이 거의 없으므로 스캔 중지
+        if (g_hProcess && g_whisperReply && !g_isInGame)
+            ScanWhisperSenderFromHeap();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode == HC_ACTION)
@@ -1230,6 +1392,7 @@ void SaveSettings() {
     DWORD v;
     v = g_swapSpaceAndControl;   RegSetValueExW(hKey, L"SwapSpaceAndControl",   0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_autoIgnoreOnGameStart; RegSetValueExW(hKey, L"AutoIgnoreOnGameStart",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_autoShowStats;         RegSetValueExW(hKey, L"AutoShowStats",          0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_whisperReply;          RegSetValueExW(hKey, L"WhisperReply",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
@@ -1240,6 +1403,7 @@ void LoadSettings() {
     DWORD v, sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"SwapSpaceAndControl",   NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_swapSpaceAndControl   = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"AutoShowStats",          NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoShowStats          = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0;
     RegCloseKey(hKey);
 }
@@ -1249,14 +1413,16 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_INITDIALOG:
         CheckDlgButton(hDlg, IDC_SWAP_KEY,      g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,   g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_WHISPER_REPLY, g_whisperReply          ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,    g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS, g_autoShowStats       ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WHISPER_REPLY,  g_whisperReply         ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
             g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)       == BST_CHECKED;
-            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)    == BST_CHECKED;
-            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)  == BST_CHECKED;
+            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)      == BST_CHECKED;
+            g_autoShowStats         = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
+            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }
@@ -1332,6 +1498,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR,
     CreateOverlayWindow(hInstance);
 
     std::thread(ProcessMonitorThread).detach();
+    std::thread(WhisperScanThread).detach();
 
     DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), nid.hWnd, SettingDlgProc);
 
