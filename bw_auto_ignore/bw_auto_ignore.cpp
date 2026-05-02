@@ -1394,6 +1394,7 @@ void SaveSettings() {
     v = g_autoIgnoreOnGameStart; RegSetValueExW(hKey, L"AutoIgnoreOnGameStart",  0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_autoShowStats;         RegSetValueExW(hKey, L"AutoShowStats",          0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_whisperReply;          RegSetValueExW(hKey, L"WhisperReply",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_fastJoin;              RegSetValueExW(hKey, L"FastJoin",               0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
 
@@ -1404,7 +1405,8 @@ void LoadSettings() {
     if (RegQueryValueExW(hKey, L"SwapSpaceAndControl",   NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_swapSpaceAndControl   = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoShowStats",          NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoShowStats          = v != 0; sz = sizeof(DWORD);
-    if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0;
+    if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"FastJoin",               NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_fastJoin               = v != 0;
     RegCloseKey(hKey);
 }
 
@@ -1416,6 +1418,7 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
         CheckDlgButton(hDlg, IDC_AUTO_IGNORE,    g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS, g_autoShowStats       ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_WHISPER_REPLY,  g_whisperReply         ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_FAST_JOIN,      g_fastJoin             ? BST_CHECKED : BST_UNCHECKED);
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
@@ -1423,6 +1426,7 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
             g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)      == BST_CHECKED;
             g_autoShowStats         = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
             g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
+            g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)        == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }
