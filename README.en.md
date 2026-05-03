@@ -4,7 +4,7 @@
 
 > StarCraft: Remastered in-game overlay — auto-lookup opponent stats, block chat, and stay focused on the game.
 
-[Download (.exe)](https://github.com/IkbeomJeon/scr_scout/raw/main/dist/bw_auto_ignore.exe) | Or build directly with Visual Studio 2022 x64
+[Download (.exe)](https://github.com/IkbeomJeon/scr_scout/raw/main/dist/scr_scout.exe) | Or build directly with Visual Studio 2022 x64
 
 ---
 

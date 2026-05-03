@@ -984,7 +984,7 @@ static void RenderOverlay()
     {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowSizeConstraints(ImVec2(420, 60), ImVec2(600, 700));
-        ImGui::Begin(u8"bw_auto_ignore", nullptr,
+        ImGui::Begin(u8"SCR Scout", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
 
@@ -1075,7 +1075,7 @@ static void RenderOverlay()
         RECT newRgn = {0,0,0,0};
 
         if (g_showGui) {
-            ImGuiWindow* w = ImGui::FindWindowByName(u8"bw_auto_ignore");
+            ImGuiWindow* w = ImGui::FindWindowByName(u8"SCR Scout");
             if (w && w->Size.x > 0) {
                 newRgn.left   = (LONG)w->Pos.x;
                 newRgn.top    = (LONG)w->Pos.y;
@@ -1411,7 +1411,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 // ---------------------------------------------------------------------------
 // 설정 저장/로드
 // ---------------------------------------------------------------------------
-static const wchar_t* REG_KEY = L"Software\\bw_auto_ignore";
+static const wchar_t* REG_KEY = L"Software\\scr_scout";
 
 void SaveSettings() {
     HKEY hKey;
@@ -1511,7 +1511,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance) {
 
 BOOL InitInstance(HINSTANCE hInstance, int) {
     hInst = hInstance;
-    HWND hWnd = CreateWindowW(szWindowClass, L"bw_auto_ignore", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowW(szWindowClass, L"SCR Scout", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
     if (!hWnd) return FALSE;
     ShowWindow(hWnd, SW_HIDE); UpdateWindow(hWnd);
@@ -1519,14 +1519,14 @@ BOOL InitInstance(HINSTANCE hInstance, int) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP+1;
     nid.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_BWAUTOIGNORE));
-    wcscpy_s(nid.szTip, L"bw_auto_ignore");
+    wcscpy_s(nid.szTip, L"SCR Scout");
     Shell_NotifyIcon(NIM_ADD, &nid);
     return TRUE;
 }
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow)
 {
-    HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\bw_auto_ignoreMutex");
+    HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\scr_scoutMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     DetectLanguage(lpCmdLine);

@@ -22,7 +22,8 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{3c2f76c9-0a51-4e08-98a3-c3354d6c1ff7}</ProjectGuid>
-    <RootNamespace>bwautoignore</RootNamespace>
+    <RootNamespace>scr_scout</RootNamespace>
+    <TargetName>scr_scout</TargetName>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

@@ -4,7 +4,7 @@
 
 > StarCraft: Remastered 인게임 오버레이 — 상대방 전적 자동 조회부터 채팅 차단까지, 게임에 집중하세요.
 
-[Download (.exe)](https://github.com/IkbeomJeon/scr_scout/raw/main/dist/bw_auto_ignore.exe) | Visual Studio 2022 x64 직접 빌드 가능
+[Download (.exe)](https://github.com/IkbeomJeon/scr_scout/raw/main/dist/scr_scout.exe) | Visual Studio 2022 x64 직접 빌드 가능
 
 ---
 
