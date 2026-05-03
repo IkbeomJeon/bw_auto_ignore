@@ -53,6 +53,26 @@ const ULONGLONG CHAT_LOG_SCAN_START   = 0x1060000; // 귓말 로그 버퍼 스�
 const ULONGLONG CHAT_LOG_SCAN_END     = 0x1080000; // 귓말 로그 버퍼 스캔 끝
 
 // ---------------------------------------------------------------------------
+// 언어 설정
+// ---------------------------------------------------------------------------
+bool g_isKorean = true;
+
+// 한/영 문자열 선택 헬퍼
+#define S(ko, en) (g_isKorean ? (ko) : (en))
+#define WS(ko, en) (g_isKorean ? (ko) : (en))
+
+static void DetectLanguage(LPWSTR lpCmdLine)
+{
+    if (lpCmdLine) {
+        std::wstring cmd(lpCmdLine);
+        if (cmd.find(L"--lang=en") != std::wstring::npos) { g_isKorean = false; return; }
+        if (cmd.find(L"--lang=ko") != std::wstring::npos) { g_isKorean = true;  return; }
+    }
+    LANGID lang = GetUserDefaultUILanguage();
+    g_isKorean = (PRIMARYLANGID(lang) == LANG_KOREAN);
+}
+
+// ---------------------------------------------------------------------------
 // 전역 변수
 // ---------------------------------------------------------------------------
 int KEY_IGNORE = VK_F9;
@@ -968,7 +988,7 @@ static void RenderOverlay()
             std::string utf8(g_mapName.size()*3+1, 0);
             WideCharToMultiByte(CP_UTF8, 0, g_mapName.c_str(), -1, &utf8[0], (int)utf8.size(), NULL, NULL);
             ImGui::SetWindowFontScale(1.3f);
-            ImGui::TextColored(ImVec4(1,1,0.4f,1), u8"맵: %s", utf8.c_str());
+            ImGui::TextColored(ImVec4(1,1,0.4f,1), S(u8"맵: %s", "Map: %s"), utf8.c_str());
             ImGui::SetWindowFontScale(1.0f);
             ImGui::Separator();
         }
@@ -976,23 +996,23 @@ static void RenderOverlay()
         // ============================================================
         // 전적 조회
         // ============================================================
-        ImGui::SeparatorText(u8"전적 조회");
+        ImGui::SeparatorText(S(u8"전적 조회", "Stats"));
         {
             // 테이블 렌더 람다
             auto RenderProfileTable = [](const DisplayProfile& prof) {
                 if (!prof.statusMsg.empty())
                     ImGui::TextDisabled("%s", prof.statusMsg.c_str());
                 if (!prof.valid) return;
-                ImGui::TextColored(ImVec4(1,0.85f,0,1), u8"배틀태그: %s#", prof.battleTag.c_str());
+                ImGui::TextColored(ImVec4(1,0.85f,0,1), S(u8"배틀태그: %s#", "BattleTag: %s#"), prof.battleTag.c_str());
                 if (ImGui::BeginTable("##toons", 6,
                     ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg))
                 {
-                    ImGui::TableSetupColumn("GW",          ImGuiTableColumnFlags_WidthFixed, 32);
-                    ImGui::TableSetupColumn(u8"아이디",     ImGuiTableColumnFlags_WidthFixed, 120);
-                    ImGui::TableSetupColumn(u8"현재 시즌",  ImGuiTableColumnFlags_WidthFixed, 78);
-                    ImGui::TableSetupColumn(u8"종족",       ImGuiTableColumnFlags_WidthFixed, 24);
-                    ImGui::TableSetupColumn(u8"역대 최고",  ImGuiTableColumnFlags_WidthFixed, 78);
-                    ImGui::TableSetupColumn(u8"연속",       ImGuiTableColumnFlags_WidthFixed, 48);
+                    ImGui::TableSetupColumn("GW",                                          ImGuiTableColumnFlags_WidthFixed, 32);
+                    ImGui::TableSetupColumn(S(u8"아이디",    "ID"),                         ImGuiTableColumnFlags_WidthFixed, 120);
+                    ImGui::TableSetupColumn(S(u8"현재 시즌", "Current"),                    ImGuiTableColumnFlags_WidthFixed, 78);
+                    ImGui::TableSetupColumn(S(u8"종족",      "Race"),                       ImGuiTableColumnFlags_WidthFixed, 24);
+                    ImGui::TableSetupColumn(S(u8"역대 최고", "Best"),                       ImGuiTableColumnFlags_WidthFixed, 78);
+                    ImGui::TableSetupColumn(S(u8"연속",      "Streak"),                     ImGuiTableColumnFlags_WidthFixed, 48);
                     ImGui::TableHeadersRow();
                     for (auto& t : prof.toons) {
                         ImGui::TableNextRow();
@@ -1000,7 +1020,7 @@ static void RenderOverlay()
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%s", t.name.c_str());
                         ImGui::TableSetColumnIndex(2);
                         if (t.cur_tier != 'U') ImGui::TextColored(TierColor(t.cur_tier), "%c %4d S%d", t.cur_tier, t.cur_rating, t.cur_season);
-                        else ImGui::TextDisabled(u8"미배치");
+                        else ImGui::TextDisabled(S(u8"미배치", "Unranked"));
                         ImGui::TableSetColumnIndex(3);
                         char rc = t.cur_race; ImGui::Text("%c", (rc == 'U') ? '-' : rc);
                         ImGui::TableSetColumnIndex(4);
@@ -1008,9 +1028,9 @@ static void RenderOverlay()
                         else ImGui::TextDisabled("-");
                         ImGui::TableSetColumnIndex(5);
                         if (t.win_streak > 0)
-                            ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), u8"%d연승", t.win_streak);
+                            ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), S(u8"%dW연승", "%dW"), t.win_streak);
                         else if (t.loss_streak > 0)
-                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), u8"%d연패", t.loss_streak);
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), S(u8"%dL연패", "%dL"), t.loss_streak);
                         else
                             ImGui::TextDisabled("-");
                     }
@@ -1026,7 +1046,9 @@ static void RenderOverlay()
                 autoProfs    = g_autoProfiles;
             }
             if (autoFetching)
-                ImGui::TextDisabled(u8"상대방 조회 중...");
+                ImGui::TextDisabled(S(u8"상대방 조회 중...", "Fetching stats..."));
+            else if (!g_isInGame && autoProfs.empty())
+                ImGui::TextDisabled(S(u8"게임 대기 중...", "Waiting for game..."));
             for (auto& prof : autoProfs)
                 RenderProfileTable(prof);
 
@@ -1417,15 +1439,20 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
         CheckDlgButton(hDlg, IDC_SWAP_KEY,      g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_AUTO_IGNORE,    g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS, g_autoShowStats       ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_WHISPER_REPLY,  g_whisperReply         ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_FAST_JOIN,      g_fastJoin             ? BST_CHECKED : BST_UNCHECKED);
+        if (!g_isKorean) {
+            SetWindowTextW(hDlg, L"Settings");
+            SetDlgItemTextW(hDlg, IDC_SWAP_KEY,       L"Use Space bar as Control key");
+            SetDlgItemTextW(hDlg, IDC_AUTO_IGNORE,    L"Auto-ignore opponent's chat on game start");
+            SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS,L"Auto-display stats 5 seconds after game start");
+            SetDlgItemTextW(hDlg, IDC_STATIC,         L"You can change these settings anytime by double-clicking the system tray icon.");
+        }
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
             g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)       == BST_CHECKED;
             g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)      == BST_CHECKED;
             g_autoShowStats         = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
-            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
             g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)        == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
@@ -1449,7 +1476,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wParam) == 1002) MessageBox(hWnd, L"F9: ignore\nF8: unignore\nF12: 전적 GUI", L"Help", MB_OK | MB_ICONINFORMATION);
+        if (LOWORD(wParam) == 1002) MessageBox(hWnd, WS(L"F9: 채팅 무시\nF8: 무시 해제\nF12: 전적 오버레이\nShift+Enter: 귓말 빠른 답장", L"F9: Ignore chat\nF8: Unignore\nF12: Stats overlay\nShift+Enter: Quick whisper reply"), L"Help", MB_OK | MB_ICONINFORMATION);
         else if (LOWORD(wParam) == 1003) DestroyWindow(hWnd);
         else if (LOWORD(wParam) == 1004) DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWnd, SettingDlgProc);
         break;
@@ -1486,11 +1513,12 @@ BOOL InitInstance(HINSTANCE hInstance, int) {
     return TRUE;
 }
 
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int nCmdShow)
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow)
 {
     HANDLE hMutex = CreateMutex(NULL, TRUE, L"Local\\bw_auto_ignoreMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    DetectLanguage(lpCmdLine);
     _setmode(_fileno(stdout), _O_U16TEXT);
     setlocale(LC_ALL, "");
     LoadSettings();

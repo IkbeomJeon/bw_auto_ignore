@@ -30,11 +30,6 @@ Shows the map name at the top of the overlay so you can instantly identify **map
 
 Easily assign unit groups **7, 8, 9, 0** using the space bar — no more awkward finger stretching.
 
-### 5. Quick Whisper Reply
-
-Press **Shift+Enter** to automatically type `/w <last sender> ` in chat, so you can instantly reply to the most recent whisper.  
-If the chat window is closed, it opens it automatically. Can be enabled in tray settings.
-
 ---
 
 ## Hotkeys
@@ -44,7 +39,6 @@ If the chat window is closed, it opens it automatically. Can be enabled in tray 
 | F12 | Toggle stat overlay on/off |
 | F9 | Ignore opponent's chat |
 | F8 | Unignore opponent's chat |
-| Shift+Enter | Quick whisper reply (enable in settings) |
 
 ## Settings
 
