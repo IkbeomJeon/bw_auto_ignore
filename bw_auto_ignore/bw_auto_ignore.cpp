@@ -71,7 +71,7 @@ NOTIFYICONDATA nid = { 0 };
 
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
-bool g_autoShowStats = false;  // 게임 시작 후 5초간 전적 오버레이 자동 표시
+bool g_autoShowStats = true;   // 게임 시작 후 5초간 전적 오버레이 자동 표시
 bool g_whisperReply = false;   // Shift+Enter: 귓말 발신자에게 /w 입력
 
 std::string g_cachedWhisperSender;
