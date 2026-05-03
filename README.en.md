@@ -1,10 +1,10 @@
-# bw_auto_ignore
+# SCR Scout
 
 [English](README.en.md) | [한국어](README.md)
 
 > StarCraft: Remastered in-game overlay — auto-lookup opponent stats, block chat, and stay focused on the game.
 
-[Download (.exe)](https://github.com/ikbeomjeon/bw_auto_ignore/raw/main/dist/bw_auto_ignore.exe) | Or build directly with Visual Studio 2022 x64
+[Download (.exe)](https://github.com/IkbeomJeon/scr_scout/raw/main/dist/bw_auto_ignore.exe) | Or build directly with Visual Studio 2022 x64
 
 ---
 
