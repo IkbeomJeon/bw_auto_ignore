@@ -73,6 +73,11 @@ static void DetectLanguage(LPWSTR lpCmdLine)
 }
 
 // ---------------------------------------------------------------------------
+// 버전
+// ---------------------------------------------------------------------------
+#define APP_VERSION L"1.0.0"
+
+// ---------------------------------------------------------------------------
 // 전역 변수
 // ---------------------------------------------------------------------------
 int KEY_IGNORE = VK_F9;
@@ -1445,7 +1450,7 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
             SetDlgItemTextW(hDlg, IDC_SWAP_KEY,       L"Use Space bar as Control key");
             SetDlgItemTextW(hDlg, IDC_AUTO_IGNORE,    L"Auto-ignore opponent's chat on game start");
             SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS,L"Auto-display stats 5 seconds after game start");
-            SetDlgItemTextW(hDlg, IDC_STATIC,         L"You can change these settings anytime by double-clicking the system tray icon.");
+            SetDlgItemTextW(hDlg, IDC_STATIC,         L"You can change these settings anytime by right-clicking the system tray icon.");
         }
         return (INT_PTR)TRUE;
     case WM_COMMAND:
@@ -1469,6 +1474,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HMENU hM = CreatePopupMenu();
             AppendMenu(hM, MF_STRING, 1002, L"Help");
             AppendMenu(hM, MF_STRING, 1004, L"Setting");
+            AppendMenu(hM, MF_STRING, 1005, L"About");
             AppendMenu(hM, MF_STRING, 1003, L"Exit");
             SetForegroundWindow(hWnd);
             TrackPopupMenu(hM, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
@@ -1476,9 +1482,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wParam) == 1002) MessageBox(hWnd, WS(L"F9: 채팅 무시\nF8: 무시 해제\nF12: 전적 오버레이\nShift+Enter: 귓말 빠른 답장", L"F9: Ignore chat\nF8: Unignore\nF12: Stats overlay\nShift+Enter: Quick whisper reply"), L"Help", MB_OK | MB_ICONINFORMATION);
+        if (LOWORD(wParam) == 1002) MessageBox(hWnd, WS(L"F9: 채팅 무시\nF8: 무시 해제\nF12: 전적 오버레이", L"F9: Ignore chat\nF8: Unignore\nF12: Stats overlay"), L"Help", MB_OK | MB_ICONINFORMATION);
         else if (LOWORD(wParam) == 1003) DestroyWindow(hWnd);
         else if (LOWORD(wParam) == 1004) DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWnd, SettingDlgProc);
+        else if (LOWORD(wParam) == 1005) {
+            std::wstring msg = std::wstring(L"SCR Scout v") + APP_VERSION +
+                L"\n\nhttps://github.com/IkbeomJeon/scr_scout\njeonikbeom@gmail.com";
+            MessageBox(hWnd, msg.c_str(), L"About SCR Scout", MB_OK | MB_ICONINFORMATION);
+        }
         break;
     case WM_DESTROY: PostQuitMessage(0); break;
     default: return DefWindowProc(hWnd, msg, wParam, lParam);
