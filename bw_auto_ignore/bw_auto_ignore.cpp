@@ -96,16 +96,12 @@ NOTIFYICONDATA nid = { 0 };
 
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
-bool g_autoShowStats = true;   // 게임 시작 후 5초간 전적 오버레이 자동 표시
-bool g_whisperReply = false;   // Shift+Enter: 귓말 발신자에게 /w 입력
+bool g_autoShowStats = true;   // 게임 시작 후 10초간 전적 오버레이 자동 표시
+bool g_showGuiManual = false;  // F12로 수동 활성화 여부
+bool g_whisperReply = true;    // Shift+Enter: 귓말 발신자에게 /w 입력
 
 std::string g_cachedWhisperSender;
 std::mutex  g_whisperMutex;
-
-// 이미 감지한 inbound (sender, content) 쌍 - 새 귓말 감지용
-std::set<std::pair<std::string,std::string>> g_seenInbound;
-bool g_firstWhisperScan = true;
-std::mutex g_senderMutex;
 bool g_fastJoin = false;      // 공개방 빠른 입장 (현재 비활성)
 bool g_fastJoinActive = false;
 bool g_isInGame = false;
@@ -128,6 +124,23 @@ bool                    g_showGui           = false;
 // ---------------------------------------------------------------------------
 // 전적 조회 데이터 구조
 // ---------------------------------------------------------------------------
+// 종족별 매치업 통계 (상대 종족 기준)
+struct RaceMatchStats {
+    int games = 0, wins = 0, dodge = 0, disc = 0;
+    float WinRate()   const { return games > 0 ? (float)wins  / games : -1.f; }
+    float DodgeRate() const { return games > 0 ? (float)dodge / games :  0.f; }
+    float DiscRate()  const { return games > 0 ? (float)disc  / games :  0.f; }
+};
+// T=0, Z=1, P=2
+struct MatchHistoryStats {
+    int total = 0, wins = 0, dodge = 0, disc = 0;
+    RaceMatchStats vs[3];
+    bool fetched = false;
+    float WinRate()   const { return total > 0 ? (float)wins  / total : -1.f; }
+    float DodgeRate() const { return total > 0 ? (float)dodge / total :  0.f; }
+    float DiscRate()  const { return total > 0 ? (float)disc  / total :  0.f; }
+};
+
 struct ToonStat {
     std::string name;       // 인게임 이름 (UTF-8)
     int  gateway    = 0;    // 10=USW 11=USE 12=EU 20=Asia 30=KR
@@ -140,11 +153,13 @@ struct ToonStat {
     int  best_season = 0;  // 역대 최고 달성 시즌 번호
     int  win_streak  = 0;  // 현재 연승
     int  loss_streak = 0;  // 현재 연패
+    MatchHistoryStats hist; // 매치 기록 통계
 };
 
 struct DisplayProfile {
     std::string          battleTag;
     std::vector<ToonStat> toons;
+    std::string          queryName; // 조회에 사용된 인게임 이름
     bool valid    = false;
     bool fetching = false;
     std::string statusMsg;
@@ -152,6 +167,11 @@ struct DisplayProfile {
 
 static std::vector<DisplayProfile> g_autoProfiles;
 static bool          g_autoFetching = false;
+static DisplayProfile g_selfProfile;
+static bool          g_selfFetching = false;
+static bool          g_selfFetched  = false;
+static HANDLE        g_selfLastProcess = NULL;
+static ULONGLONG     g_selfToonAddr = 0;  // HAT: 문자열 주소 캐시 (재스캔 방지)
 static std::mutex    g_profileMutex;
 
 // ---------------------------------------------------------------------------
@@ -272,152 +292,102 @@ bool IsChatMode()
     return flag == 1;
 }
 
-// SC:R 힙 메모리에서 귓말 발신자를 추적한다.
+// SC:R MAPPED 채팅 링버퍼에서 귓말 발신자를 추적한다.
 //
-// 접근법:
-//   1. 모든 committed 페이지에서 whisperInbound/whisperOutbound terminal("}]") 검색
-//   2. 각 terminal 주소에서 앞으로 4KB를 ReadProcessMemory로 직접 읽어
-//      legacyToonName과 content 추출 (페이지 경계 자동 처리)
-//   3. 같은 발신자의 terminal 중 가장 높은 주소를 "살아있는 버퍼"로 선택
-//   4. 이전 스캔과 content 비교 → 바뀐 발신자 = 최근 귓말 상대
-void ScanWhisperSenderFromHeap()
+// 구조:
+//   - 0x7FF639270000 + 0x106E0CB = 슬롯 0 시작
+//   - 슬롯 크기 218바이트(0xDA), 총 10슬롯 = 2180바이트
+//   - 각 슬롯: null-terminated ASCII, "sender> content" 형식이면 귓말
+//   - SC:R ASLR 비활성화 → 모듈 베이스는 재시작해도 고정
+static const ULONGLONG WHISPER_RING_RVA  = 0x106E0CBULL;  // 슬롯 0 RVA
+static const int       WHISPER_SLOT_SIZE = 0xDA;           // 218바이트
+static const int       WHISPER_SLOT_COUNT = 10;
+
+void ScanWhisperSenderFromRingBuffer()
 {
     if (!g_hProcess) return;
 
-    static const std::string TERM_INBOUND     = "\"type\":\"whisperInbound\"}]";
-    static const std::string TERM_INBOUND_ESC = "\\\"type\\\":\\\"whisperInbound\\\"}]";
-    static const std::string NAME_TAG         = "legacyToonName\":\"";
-    static const std::string NAME_TAG_ESC     = "legacyToonName\\\":\\\"";
-    static const std::string CONTENT_TAG      = "\"content\":\"";
-    static const std::string CONTENT_TAG_ESC  = "\\\"content\\\":\\\"";
+    ULONGLONG modBase = GetStarCraftModuleBase();
+    if (!modBase) return;
 
-    const SIZE_T BACK = 4096;
+    ULONGLONG slot0 = modBase + WHISPER_RING_RVA;
 
-    // 이번 스캔에서 발견된 모든 inbound (sender, content, addr)
-    struct InboundEntry { std::string sender; std::string content; ULONG_PTR addr; };
-    std::vector<InboundEntry> found;
+    // 이전 스냅샷 (프로세스 핸들 변경 시 재초기화)
+    static char    prevSlots[WHISPER_SLOT_COUNT][WHISPER_SLOT_SIZE];
+    static bool    initialized  = false;
+    static HANDLE  lastProcess  = NULL;
 
-    MEMORY_BASIC_INFORMATION mbi;
-    ULONG_PTR addr = 0;
-
-    while (VirtualQueryEx(g_hProcess, (LPCVOID)addr, &mbi, sizeof(mbi)) == sizeof(mbi))
+    if (lastProcess != g_hProcess)
     {
-        ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
-        if (mbi.State == MEM_COMMIT &&
-            mbi.Type == MEM_PRIVATE &&
-            (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) &&
-            mbi.RegionSize >= 64 && mbi.RegionSize <= 0x800000)
-        {
-            std::vector<char> buf(mbi.RegionSize);
-            SIZE_T r = 0;
-            if (ReadProcessMemory(g_hProcess, mbi.BaseAddress, buf.data(), mbi.RegionSize, &r) && r > 64)
-            {
-                std::string_view data(buf.data(), r);
-
-                struct TermSpec { const std::string* tag; bool escaped; };
-                TermSpec specs[] = {
-                    {&TERM_INBOUND,     false},
-                    {&TERM_INBOUND_ESC, true },
-                };
-
-                for (auto& spec : specs)
-                {
-                    size_t pos = 0;
-                    while ((pos = data.find(*spec.tag, pos)) != std::string_view::npos)
-                    {
-                        ULONG_PTR absAddr = (ULONG_PTR)mbi.BaseAddress + (ULONG_PTR)pos;
-
-                        std::string_view ctxView;
-                        std::vector<char> ctxExtra;
-                        size_t ctxStart = (pos >= BACK) ? pos - BACK : 0;
-                        ctxView = data.substr(ctxStart, pos - ctxStart);
-                        if (ctxView.size() < BACK && absAddr >= BACK)
-                        {
-                            ULONG_PTR readFrom = absAddr - BACK;
-                            SIZE_T readSize    = (SIZE_T)(absAddr - readFrom);
-                            ctxExtra.resize(readSize);
-                            SIZE_T ctxRead = 0;
-                            if (ReadProcessMemory(g_hProcess, (LPCVOID)readFrom, ctxExtra.data(), readSize, &ctxRead) && ctxRead > 0)
-                                ctxView = std::string_view(ctxExtra.data(), ctxRead);
-                        }
-
-                        const std::string& nameTag    = spec.escaped ? NAME_TAG_ESC    : NAME_TAG;
-                        const std::string& contentTag = spec.escaped ? CONTENT_TAG_ESC : CONTENT_TAG;
-
-                        size_t ni = ctxView.rfind(nameTag);
-                        if (ni == std::string_view::npos) { pos++; continue; }
-                        size_t ns = ni + nameTag.size();
-                        size_t ne = ctxView.find('"', ns);
-                        if (ne == std::string_view::npos || ne == ns || ne - ns >= 64)
-                        { pos++; continue; }
-                        std::string sender(ctxView.substr(ns, ne - ns));
-                        if (!sender.empty() && sender.back() == '\\') sender.pop_back();
-                        if (sender.empty() || sender.size() >= 64) { pos++; continue; }
-
-                        std::string content;
-                        size_t ci = ctxView.rfind(contentTag);
-                        if (ci != std::string_view::npos)
-                        {
-                            size_t cs = ci + contentTag.size();
-                            size_t ce = ctxView.find('"', cs);
-                            if (ce != std::string_view::npos && ce > cs && ce - cs < 256)
-                            {
-                                content = std::string(ctxView.substr(cs, ce - cs));
-                                if (!content.empty() && content.back() == '\\')
-                                    content.pop_back();
-                            }
-                        }
-
-                        found.push_back({sender, content, absAddr});
-                        pos++;
-                    }
-                }
-            }
-        }
-        if (next <= addr) break;
-        addr = next;
+        initialized = false;
+        lastProcess = g_hProcess;
     }
 
-    // 새로 발견된 (sender, content) 쌍 감지
-    std::string latestSender;
-    ULONG_PTR   latestAddr = 0;
+    // 10슬롯 한 번에 읽기 (2180바이트)
+    char buf[WHISPER_SLOT_COUNT * WHISPER_SLOT_SIZE];
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(g_hProcess, (LPCVOID)slot0, buf, sizeof(buf), &bytesRead)
+        || (int)bytesRead < WHISPER_SLOT_COUNT * WHISPER_SLOT_SIZE)
+        return;
 
+    if (!initialized)
     {
-        std::lock_guard<std::mutex> lk(g_senderMutex);
+        memcpy(prevSlots, buf, sizeof(prevSlots));
+        initialized = true;
+        // 기존 슬롯에서 귓말 발신자 초기값 설정 (역순 = 최근 우선 추정)
+        for (int i = WHISPER_SLOT_COUNT - 1; i >= 0; i--)
+        {
+            char text[WHISPER_SLOT_SIZE + 1];
+            memcpy(text, buf + i * WHISPER_SLOT_SIZE, WHISPER_SLOT_SIZE);
+            text[WHISPER_SLOT_SIZE] = '\0';
+            const char* sep = strstr(text, "> ");
+            if (sep && sep > text)
+            {
+                int prefixLen = (int)(sep - text);
+                bool allAscii = true;
+                for (int k = 0; k < prefixLen; k++)
+                    if ((unsigned char)text[k] < 33 || (unsigned char)text[k] > 126)
+                    { allAscii = false; break; }
+                if (allAscii && prefixLen > 0 && prefixLen < 64)
+                {
+                    std::lock_guard<std::mutex> lk(g_whisperMutex);
+                    g_cachedWhisperSender = std::string(text, prefixLen);
+                    break;
+                }
+            }
+        }
+        return;
+    }
 
-        if (g_firstWhisperScan)
+    // 변경된 슬롯에서 "sender> content" 파싱
+    std::string latestSender;
+    for (int i = 0; i < WHISPER_SLOT_COUNT; i++)
+    {
+        const char* slot = buf + i * WHISPER_SLOT_SIZE;
+        if (memcmp(prevSlots[i], slot, WHISPER_SLOT_SIZE) == 0) continue;
+
+        // 변경된 슬롯 파싱
+        char text[WHISPER_SLOT_SIZE + 1];
+        memcpy(text, slot, WHISPER_SLOT_SIZE);
+        text[WHISPER_SLOT_SIZE] = '\0';
+
+        // 수신 귓말 형식: "sender> content" (순수 ASCII, 한국어 없음)
+        // 발신 귓말 형식: "recipient 님에게> content" ("> " 앞에 한국어 UTF-8 포함) → 무시
+        const char* sep = strstr(text, "> ");
+        if (sep && sep > text)
         {
-            // 첫 스캔: 기존 귓말을 모두 "이미 봄"으로 등록만 하고
-            // 가장 높은 주소의 발신자를 초기 응답 대상으로 설정
-            g_firstWhisperScan = false;
-            for (auto& e : found)
-            {
-                g_seenInbound.insert({e.sender, e.content});
-                if (e.addr > latestAddr)
-                {
-                    latestAddr    = e.addr;
-                    latestSender  = e.sender;
-                }
-            }
+            int prefixLen = (int)(sep - text);
+            // "> " 앞이 모두 ASCII printable인 경우만 수신 귓말
+            bool allAscii = true;
+            for (int k = 0; k < prefixLen; k++)
+                if ((unsigned char)text[k] < 33 || (unsigned char)text[k] > 126)
+                { allAscii = false; break; }
+
+            if (allAscii && prefixLen > 0 && prefixLen < 64)
+                latestSender = std::string(text, prefixLen);
         }
-        else
-        {
-            // 이후 스캔: g_seenInbound에 없는 새 쌍 = 새 귓말
-            for (auto& e : found)
-            {
-                auto key = std::make_pair(e.sender, e.content);
-                if (g_seenInbound.find(key) == g_seenInbound.end())
-                {
-                    g_seenInbound.insert(key);
-                    // 여러 개 동시 발견 시 addr 큰 것 우선 (최선의 추측)
-                    if (e.addr > latestAddr)
-                    {
-                        latestAddr   = e.addr;
-                        latestSender = e.sender;
-                    }
-                }
-            }
-        }
+
+        memcpy(prevSlots[i], slot, WHISPER_SLOT_SIZE);
     }
 
     if (!latestSender.empty())
@@ -433,7 +403,7 @@ std::string GetLastWhisperSender()
     return g_cachedWhisperSender;
 }
 
-// 채팅창에 텍스트만 입력 (전송 없이)
+// 채팅창에 텍스트만 입력 (전송 없이, 딜레이 없음)
 void TypeText(const std::string& text)
 {
     int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, NULL, 0);
@@ -443,35 +413,45 @@ void TypeText(const std::string& text)
     for (wchar_t ch : wc) {
         if (!ch) continue;
         INPUT inputs[2] = {};
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[0].ki.wScan = ch;
-        inputs[1] = inputs[0];
-        inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs[0].type = INPUT_KEYBOARD; inputs[0].ki.dwFlags = KEYEVENTF_UNICODE; inputs[0].ki.wScan = ch;
+        inputs[1] = inputs[0]; inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         SendInput(2, inputs, sizeof(INPUT));
-        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
 // Shift+Enter: 마지막 귓말 발신자에게 /w 입력
 void SendWhisperReply()
 {
-    // Shift 키가 눌린 채로 호출되므로 먼저 릴리즈
-    INPUT shiftUp = {}; shiftUp.type = INPUT_KEYBOARD;
-    shiftUp.ki.wVk = VK_SHIFT; shiftUp.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &shiftUp, sizeof(INPUT));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
     std::string sender = GetLastWhisperSender();
     if (sender.empty()) return;
 
     std::string cmd = "/w " + sender + " ";
+    int n = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, NULL, 0);
+    std::wstring wc(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wc[0], n);
 
-    // 채팅창 열기 후 고정 딜레이 (IsChatMode 오프셋 의존 제거)
-    SendVirtualKey(VK_RETURN);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Shift 릴리즈 + Enter(채팅창 열기) + 문자들을 단일 배치로 전송
+    std::vector<INPUT> inputs;
+    auto pushVK = [&](WORD vk, bool up) {
+        INPUT in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = vk;
+        if (up) in.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs.push_back(in);
+    };
+    auto pushChar = [&](wchar_t ch) {
+        INPUT in = {}; in.type = INPUT_KEYBOARD;
+        in.ki.dwFlags = KEYEVENTF_UNICODE; in.ki.wScan = ch;
+        inputs.push_back(in);
+        in.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(in);
+    };
 
-    TypeText(cmd);
+    pushVK(VK_SHIFT, true);   // Shift 릴리즈
+    pushVK(VK_RETURN, false); // Enter down (채팅창 열기)
+    pushVK(VK_RETURN, true);  // Enter up
+    for (wchar_t ch : wc) if (ch) pushChar(ch);
+
+    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 }
 
 bool IsCreateScreen()
@@ -569,20 +549,17 @@ void UpdateOverlayPosition()
     HWND hSC = g_hStarCraftWnd;
     if (!hSC) { ShowWindow(g_hOverlay, SW_HIDE); return; }
 
-    HWND hFg = GetForegroundWindow();
-    bool scOrOverlayFg = (hFg == hSC || hFg == g_hOverlay);
-    if (!scOrOverlayFg || (!g_isInGame && !g_showGui)) { ShowWindow(g_hOverlay, SW_HIDE); return; }
+    if (!g_isInGame && !g_showGui) { ShowWindow(g_hOverlay, SW_HIDE); return; }
 
     RECT cr; GetClientRect(hSC, &cr);
     POINT tl = {0, 0}; ClientToScreen(hSC, &tl);
     int w = cr.right - cr.left, h = cr.bottom - cr.top;
 
-    // 위치/크기 변경 시에만 SetWindowPos 호출
-    static POINT s_lastTL = {-1,-1}; static SIZE s_lastSz = {-1,-1};
-    if (tl.x != s_lastTL.x || tl.y != s_lastTL.y || w != s_lastSz.cx || h != s_lastSz.cy) {
-        s_lastTL = tl; s_lastSz = {w, h};
-        SetWindowPos(g_hOverlay, HWND_TOPMOST, tl.x, tl.y, w, h, SWP_NOACTIVATE);
-    }
+    // SC 창 바로 위 z-order에 배치 → 다른 창이 SC를 가리면 오버레이도 같이 가려짐
+    HWND insertAfter = GetWindow(hSC, GW_HWNDPREV); // SC 위에 있는 창
+    if (!insertAfter || insertAfter == g_hOverlay)
+        insertAfter = HWND_TOP;
+    SetWindowPos(g_hOverlay, insertAfter, tl.x, tl.y, w, h, SWP_NOACTIVATE);
     ShowWindow(g_hOverlay, SW_SHOW);
 }
 
@@ -620,8 +597,13 @@ static ImVec4 TierColor(char t) {
 }
 
 static const char* GatewayName(int gw) {
-    switch (gw) { case 10: return "USW"; case 11: return "USE";
-                  case 12: return "EU";  case 20: return "Asia"; case 30: return "KR"; default: return "?"; }
+    switch (gw) {
+        case 10: return "USW"; case 11: return "USE";
+        case 12: return "EU";  case 20: return "Asia"; case 30: return "KR";
+        case  1: return "US";  case  2: return "EU";   case  3: return "KR"; case 4: return "Asia";
+        case 45: return "EU";
+        default: { static char buf[8]; snprintf(buf, sizeof(buf), "?%d", gw); return buf; }
+    }
 }
 
 static std::string JsonStringVal(const std::string& json, const std::string& key, size_t from = 0) {
@@ -743,10 +725,149 @@ static std::string LocalWebApiGet(const std::string& name, WORD port, int gatewa
     return result;
 }
 
+// 임의 경로 GET (UTF-8 path → wstring 변환)
+static std::string LocalWebApiGetPath(const std::string& path, WORD port) {
+    int wl = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(), NULL, 0);
+    std::wstring wpath(wl, 0);
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(), &wpath[0], wl);
+
+    HINTERNET hS = WinHttpOpen(L"StarCraft/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return "";
+    HINTERNET hC = WinHttpConnect(hS, L"127.0.0.1", port, 0);
+    if (!hC) { WinHttpCloseHandle(hS); return ""; }
+    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", wpath.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hR) { WinHttpCloseHandle(hC); WinHttpCloseHandle(hS); return ""; }
+
+    std::string result;
+    if (WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hR, NULL)) {
+        DWORD sz = 0;
+        do {
+            if (!WinHttpQueryDataAvailable(hR, &sz) || !sz) break;
+            std::vector<char> b(sz + 1, 0); DWORD rd = 0;
+            WinHttpReadData(hR, b.data(), sz, &rd);
+            result.append(b.data(), rd);
+        } while (sz > 0);
+    }
+    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+    return result;
+}
+
+// matchmaker-gameinfo JSON 파싱 → MatchHistoryStats
+// toonName: 조회 대상 플레이어 이름
+static MatchHistoryStats ParseMatchHistory(const std::string& json, const std::string& toonName, int vsLimit = 100) {
+    MatchHistoryStats stats;
+    if (json.empty() || json[0] != '[') return stats;
+    int vsCount = 0; // vsLimit까지만 종족별 집계
+
+    auto raceIdx = [](const std::string& r) -> int {
+        if (r.empty()) return -1;
+        char c = (char)toupper((unsigned char)r[0]);
+        if (c == 'T') return 0;
+        if (c == 'Z') return 1;
+        if (c == 'P') return 2;
+        return -1;
+    };
+
+    // 배열 원소 순회
+    size_t cur = 1;
+    while (cur < json.size()) {
+        size_t matchStart = json.find('{', cur);
+        if (matchStart == std::string::npos) break;
+        size_t matchEnd = FindMatchingBrace(json, matchStart);
+        if (matchEnd == std::string::npos) break;
+
+        std::string matchObj = json.substr(matchStart, matchEnd - matchStart + 1);
+
+        // game_result 섹션에서 toonName 항목 탐색
+        std::string myResult, myLeft, oppRace;
+        size_t grSearch = 0;
+        while ((grSearch = matchObj.find("\"game_result\"", grSearch)) != std::string::npos) {
+            size_t grStart = matchObj.find('{', grSearch + 13);
+            if (grStart == std::string::npos) break;
+            size_t grEnd = FindMatchingBrace(matchObj, grStart);
+            if (grEnd == std::string::npos) break;
+            std::string grJson = matchObj.substr(grStart, grEnd - grStart + 1);
+
+            // 이 game_result가 내 toon을 포함하는지 확인
+            std::string myKey = "\"" + toonName + "\"";
+            size_t myPos = grJson.find(myKey);
+            if (myPos == std::string::npos) { grSearch = grEnd + 1; continue; }
+
+            // 내 결과 추출
+            size_t myEntryStart = grJson.find('{', myPos + myKey.size());
+            if (myEntryStart != std::string::npos) {
+                size_t myEntryEnd = FindMatchingBrace(grJson, myEntryStart);
+                if (myEntryEnd != std::string::npos) {
+                    std::string myEntry = grJson.substr(myEntryStart, myEntryEnd - myEntryStart + 1);
+                    myResult = JsonStringVal(myEntry, "result");
+                    myLeft   = JsonStringVal(myEntry, "left");
+                }
+            }
+
+            // 상대 종족 추출: game_result의 다른 키(type=player) 탐색
+            size_t p = 1;
+            while (p < grJson.size() - 1 && oppRace.empty()) {
+                size_t qs = grJson.find('"', p);
+                if (qs == std::string::npos) break;
+                size_t qe = grJson.find('"', qs + 1);
+                if (qe == std::string::npos) break;
+                std::string key = grJson.substr(qs + 1, qe - qs - 1);
+
+                size_t colonPos = grJson.find(':', qe);
+                if (colonPos == std::string::npos) break;
+                size_t valStart = grJson.find('{', colonPos);
+                if (valStart == std::string::npos) break;
+                size_t valEnd = FindMatchingBrace(grJson, valStart);
+                if (valEnd == std::string::npos) break;
+
+                if (!key.empty() && key != toonName) {
+                    std::string valObj = grJson.substr(valStart, valEnd - valStart + 1);
+                    std::string r = JsonStringVal(valObj, "race");
+                    if (!r.empty()) oppRace = r;
+                }
+                p = valEnd + 1;
+            }
+            break;
+        }
+
+        if (!myResult.empty()) {
+            int ri = raceIdx(oppRace);
+            bool countVs = (ri >= 0 && vsCount < vsLimit);
+            stats.total++;
+            if (myResult == "Win") {
+                stats.wins++;
+                if (countVs) { stats.vs[ri].games++; stats.vs[ri].wins++; }
+            } else if (myResult == "Disconnect") {
+                stats.disc++;
+                if (countVs) { stats.vs[ri].games++; stats.vs[ri].disc++; }
+            } else if (myResult == "Loss") {
+                if (myLeft == "1") {
+                    stats.dodge++;
+                    if (countVs) { stats.vs[ri].games++; stats.vs[ri].dodge++; }
+                } else {
+                    if (countVs) stats.vs[ri].games++;
+                }
+            } else { // Undecided
+                if (countVs) stats.vs[ri].games++;
+            }
+            if (ri >= 0) vsCount++;
+        }
+
+        cur = matchEnd + 1;
+    }
+
+    stats.fetched = true;
+    return stats;
+}
+
 // 전적 조회 (스레드에서 호출)
 static DisplayProfile FetchProfileData(const std::string& queryName)
 {
     DisplayProfile result;
+    result.queryName = queryName;
     // 캐시된 포트 우선 사용, 실패 시 재탐색
     WORD port = g_cachedApiPort;
     if (!port || !ProbeWebApiPort(port)) {
@@ -801,7 +922,7 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         std::string name = JsonStringVal(obj, "toon");
         int guid = JsonIntVal(obj, "guid");
         int gw   = JsonIntVal(obj, "gateway_id");
-        if (!name.empty() && guid > 0) guidMap[guid] = {name, gw};
+if (!name.empty() && guid > 0) guidMap[guid] = {name, gw};
     });
 
     // toon_guid_by_gateway 에서 name→gateway 맵 빌드 (폴백용)
@@ -921,6 +1042,31 @@ static DisplayProfile FetchProfileData(const std::string& queryName)
         return a.gateway != b.gateway ? a.gateway < b.gateway : a.name < b.name;
     });
 
+    // 5. 각 toon의 match history 통계 조회
+    int curSeason = JsonIntVal(json, "matchmaked_current_season");
+    // --- 디버그 로그 ---
+    FILE* dbg = nullptr; fopen_s(&dbg, "C:\\wd\\bw_auto_ignore\\hist_debug.log", "w");
+    if (dbg) { fprintf(dbg, "curSeason=%d toons=%d\n", curSeason, (int)result.toons.size()); fflush(dbg); }
+    for (auto& t : result.toons) {
+        if (t.cur_season <= 0 && curSeason <= 0) {
+            if (dbg) fprintf(dbg, "SKIP %s gw=%d cur_season=%d\n", t.name.c_str(), t.gateway, t.cur_season);
+            continue;
+        }
+        int season = (t.cur_season > 0) ? t.cur_season : curSeason;
+        std::string path = "/web-api/v1/matchmaker-gameinfo-by-toon/" + t.name
+            + "/" + std::to_string(t.gateway > 0 ? t.gateway : 30)
+            + "/1/" + std::to_string(season) + "?limit=1000";
+        if (dbg) fprintf(dbg, "FETCH %s  path=%s\n", t.name.c_str(), path.c_str());
+        std::string histJson = LocalWebApiGetPath(path, port);
+        if (dbg) { fprintf(dbg, "  resp_len=%d  first50=[%s]\n", (int)histJson.size(), histJson.substr(0, 50).c_str()); fflush(dbg); }
+        if (!histJson.empty()) {
+            t.hist = ParseMatchHistory(histJson, t.name);
+            if (dbg) fprintf(dbg, "  fetched=%d total=%d vsT=%d vsZ=%d vsP=%d\n",
+                t.hist.fetched, t.hist.total, t.hist.vs[0].games, t.hist.vs[1].games, t.hist.vs[2].games);
+        }
+    }
+    if (dbg) fclose(dbg);
+
     result.valid = true;
     return result;
 }
@@ -948,12 +1094,42 @@ static void AutoFetchOpponents()
         g_autoFetching = false;
     }
 
-    if (g_autoShowStats && !results.empty()) {
-        g_showGui = true;  // 타이머(WM_TIMER)가 200ms 이내에 렌더링 처리
+    if (g_autoShowStats && !results.empty() && !g_showGuiManual) {
+        g_showGui = true;
         std::thread([]() {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            g_showGui = false;
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (!g_showGuiManual) g_showGui = false;
         }).detach();
+    }
+}
+
+static void FetchSelfProfile()
+{
+    const char myPfx[] = "HAT:";
+    size_t plen = strlen(myPfx);
+    // 전체 메모리 스캔 (최초 1회)
+    auto addrs = FindAllPrefixAddresses(g_hProcess, myPfx);
+    std::string curID;
+    ULONGLONG foundAddr = 0;
+    for (ULONGLONG a : addrs) {
+        std::string s = ReadNullTerminatedString(g_hProcess, a);
+        if (s.compare(0, plen, myPfx) != 0) continue;
+        size_t e = s.find('\x10', plen);
+        std::string id = (e != std::string::npos && e > plen) ? s.substr(plen, e - plen) : s.substr(plen);
+        if (!id.empty()) { curID = id; foundAddr = a; break; }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_profileMutex);
+        g_selfToonAddr = foundAddr;
+    }
+    DisplayProfile p;
+    if (!curID.empty())
+        p = FetchProfileData(curID);
+    {
+        std::lock_guard<std::mutex> lk(g_profileMutex);
+        g_selfProfile  = p;
+        g_selfFetching = false;
+        g_selfFetched  = true;
     }
 }
 
@@ -983,7 +1159,7 @@ static void RenderOverlay()
     if (g_showGui)
     {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(420, 60), ImVec2(600, 700));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(200, 60), ImVec2(600, 700));
         ImGui::Begin(u8"SCR Scout", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
@@ -1003,44 +1179,222 @@ static void RenderOverlay()
         // ============================================================
         ImGui::SeparatorText(S(u8"전적 조회", "Stats"));
         {
-            // 테이블 렌더 람다
-            auto RenderProfileTable = [](const DisplayProfile& prof) {
+            // 셀 내 텍스트 가운데 정렬 헬퍼
+            auto CellCenter = [](const char* str) {
+                float cw = ImGui::GetColumnWidth();
+                float tw = ImGui::CalcTextSize(str).x;
+                float off = (cw - tw) * 0.5f;
+                if (off > 0.f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
+            };
+
+            // 기존 테이블 렌더 람다 (티어 표)
+            auto RenderProfileTable = [&CellCenter](const DisplayProfile& prof) {
                 if (!prof.statusMsg.empty())
                     ImGui::TextDisabled("%s", prof.statusMsg.c_str());
                 if (!prof.valid) return;
                 ImGui::TextColored(ImVec4(1,0.85f,0,1), S(u8"배틀태그: %s#", "BattleTag: %s#"), prof.battleTag.c_str());
+                // 열 순서: GW, ID, Race, Cur, Best, 연승
+                const char* hGW   = "GW";
+                const char* hID   = S(u8"아이디", "ID");
+                const char* hRace = S(u8"종족",   "Race");
+                const char* hCur  = S(u8"현재",   "Curr");
+                const char* hBest = S(u8"최고",   "Best");
+                const char* hStr  = S(u8"연승",   "Streak");
+                float tp = 10.f; // 헤더 잘림 방지용 여유
+                float wGW   = std::max(ImGui::CalcTextSize(hGW).x,   ImGui::CalcTextSize("Asia").x)     + tp;
+                float wRace = std::max(ImGui::CalcTextSize(hRace).x,  ImGui::CalcTextSize("T").x)        + tp;
+                float wCur  = std::max(ImGui::CalcTextSize(hCur).x,  ImGui::CalcTextSize("D1234 S19").x) + tp;
+                float wBest = std::max(ImGui::CalcTextSize(hBest).x, ImGui::CalcTextSize("D1234 S19").x) + tp;
+                float wStr  = std::max(ImGui::CalcTextSize(hStr).x,  ImGui::CalcTextSize("99W").x)       + tp;
+                auto RaceColor = [](char rc) -> ImVec4 {
+                    if (rc == 'T') return ImVec4(0.45f, 0.70f, 1.00f, 1.f);
+                    if (rc == 'P') return ImVec4(1.00f, 0.85f, 0.25f, 1.f);
+                    if (rc == 'Z') return ImVec4(1.00f, 0.38f, 0.38f, 1.f);
+                    return ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                };
+                ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3, 2));
                 if (ImGui::BeginTable("##toons", 6,
-                    ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg))
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX))
                 {
-                    ImGui::TableSetupColumn("GW",                                          ImGuiTableColumnFlags_WidthFixed, 32);
-                    ImGui::TableSetupColumn(S(u8"아이디",    "ID"),                         ImGuiTableColumnFlags_WidthFixed, 120);
-                    ImGui::TableSetupColumn(S(u8"현재 시즌", "Current"),                    ImGuiTableColumnFlags_WidthFixed, 78);
-                    ImGui::TableSetupColumn(S(u8"종족",      "Race"),                       ImGuiTableColumnFlags_WidthFixed, 24);
-                    ImGui::TableSetupColumn(S(u8"역대 최고", "Best"),                       ImGuiTableColumnFlags_WidthFixed, 78);
-                    ImGui::TableSetupColumn(S(u8"연속",      "Streak"),                     ImGuiTableColumnFlags_WidthFixed, 48);
-                    ImGui::TableHeadersRow();
+                    ImGui::TableSetupColumn(hGW,   ImGuiTableColumnFlags_WidthFixed, wGW);
+                    ImGui::TableSetupColumn(hID,   ImGuiTableColumnFlags_WidthFixed, 0);
+                    ImGui::TableSetupColumn(hRace, ImGuiTableColumnFlags_WidthFixed, wRace);
+                    ImGui::TableSetupColumn(hCur,  ImGuiTableColumnFlags_WidthFixed, wCur);
+                    ImGui::TableSetupColumn(hBest, ImGuiTableColumnFlags_WidthFixed, wBest);
+                    ImGui::TableSetupColumn(hStr,  ImGuiTableColumnFlags_WidthFixed, wStr);
+                    // 헤더 중앙 정렬
+                    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+                    for (int col = 0; col < 6; col++) {
+                        ImGui::TableSetColumnIndex(col);
+                        const char* name = ImGui::TableGetColumnName(col);
+                        CellCenter(name);
+                        ImGui::TableHeader(name);
+                    }
                     for (auto& t : prof.toons) {
+                        bool isQuery = (t.name == prof.queryName);
                         ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", GatewayName(t.gateway));
+                        if (isQuery)
+                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                ImGui::ColorConvertFloat4ToU32(ImVec4(0.3f, 0.5f, 0.2f, 0.35f)));
+
+                        // col 0: GW
+                        char gwStr[8]; snprintf(gwStr, sizeof(gwStr), "%s", GatewayName(t.gateway));
+                        ImGui::TableSetColumnIndex(0); CellCenter(gwStr); ImGui::TextDisabled("%s", gwStr);
+
+                        // col 1: ID
                         ImGui::TableSetColumnIndex(1); ImGui::Text("%s", t.name.c_str());
+
+                        // col 2: Race (종족별 색상)
                         ImGui::TableSetColumnIndex(2);
-                        if (t.cur_tier != 'U') ImGui::TextColored(TierColor(t.cur_tier), "%c %4d S%d", t.cur_tier, t.cur_rating, t.cur_season);
-                        else ImGui::TextDisabled(S(u8"미배치", "Unranked"));
+                        char rc = t.cur_race; char rcStr[4]; snprintf(rcStr, sizeof(rcStr), "%c", (rc=='U')?'-':rc);
+                        CellCenter(rcStr);
+                        if (rc != 'U') ImGui::TextColored(RaceColor(rc), "%s", rcStr);
+                        else ImGui::TextDisabled("%s", rcStr);
+
+                        // col 3: Cur
                         ImGui::TableSetColumnIndex(3);
-                        char rc = t.cur_race; ImGui::Text("%c", (rc == 'U') ? '-' : rc);
+                        if (t.cur_tier != 'U') {
+                            char buf[32]; snprintf(buf, sizeof(buf), "%c%d S%d", t.cur_tier, t.cur_rating, t.cur_season);
+                            CellCenter(buf); ImGui::TextColored(TierColor(t.cur_tier), "%s", buf);
+                        } else {
+                            const char* u = "-";
+                            CellCenter(u); ImGui::TextDisabled("%s", u);
+                        }
+
+                        // col 4: Best
                         ImGui::TableSetColumnIndex(4);
-                        if (t.best_tier != 'U') ImGui::TextColored(TierColor(t.best_tier), "%c %4d S%d", t.best_tier, t.best_rating, t.best_season);
-                        else ImGui::TextDisabled("-");
+                        if (t.best_tier != 'U') {
+                            char buf[32]; snprintf(buf, sizeof(buf), "%c%d S%d", t.best_tier, t.best_rating, t.best_season);
+                            CellCenter(buf); ImGui::TextColored(TierColor(t.best_tier), "%s", buf);
+                        } else { CellCenter("-"); ImGui::TextDisabled("-"); }
+
+                        // col 5: 연승/연패
                         ImGui::TableSetColumnIndex(5);
-                        if (t.win_streak > 0)
-                            ImGui::TextColored(ImVec4(0.3f, 0.6f, 1.0f, 1.0f), S(u8"%dW연승", "%dW"), t.win_streak);
-                        else if (t.loss_streak > 0)
-                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), S(u8"%dL연패", "%dL"), t.loss_streak);
-                        else
-                            ImGui::TextDisabled("-");
+                        if (t.win_streak > 0) {
+                            char buf[16]; snprintf(buf, sizeof(buf), "%dW", t.win_streak);
+                            CellCenter(buf); ImGui::TextColored(ImVec4(0.3f,0.6f,1.f,1.f), "%s", buf);
+                        } else if (t.loss_streak > 0) {
+                            char buf[16]; snprintf(buf, sizeof(buf), "%dL", t.loss_streak);
+                            CellCenter(buf); ImGui::TextColored(ImVec4(1.f,0.3f,0.3f,1.f), "%s", buf);
+                        } else { CellCenter("-"); ImGui::TextDisabled("-"); }
                     }
                     ImGui::EndTable();
                 }
+                ImGui::PopStyleVar(); // CellPadding
+            };
+
+            // queryName toon의 hist 카드 (테이블 형태)
+            auto RenderHistCard = [&CellCenter](const DisplayProfile& prof, bool showVsRace) {
+                if (!prof.valid) return;
+                const ToonStat* t = nullptr;
+                for (auto& ts : prof.toons)
+                    if (ts.name == prof.queryName) { t = &ts; break; }
+                if (!t && !prof.toons.empty()) t = &prof.toons[0];
+                if (!t || !t->hist.fetched) return;
+
+                float wr = t->hist.WinRate();
+                if (wr < 0.f) { ImGui::TextDisabled(S(u8"기록 없음", "No records")); return; }
+
+                // T=0, Z=1, P=2 → 표시 순서 T, P, Z
+                const int      kRaceOrder[3] = { 0, 2, 1 };
+                const char*    kRaceLabel[3] = { "T", "P", "Z" };
+                const ImVec4   kRaceColor[3] = {
+                    ImVec4(0.45f, 0.70f, 1.00f, 1.f),  // T 파랑
+                    ImVec4(1.00f, 0.85f, 0.25f, 1.f),  // P 노랑
+                    ImVec4(1.00f, 0.38f, 0.38f, 1.f),  // Z 빨강
+                };
+                const ImVec4   kBarColor[3] = {
+                    ImVec4(0.25f, 0.50f, 0.90f, 0.85f),
+                    ImVec4(0.80f, 0.65f, 0.10f, 0.85f),
+                    ImVec4(0.85f, 0.20f, 0.20f, 0.85f),
+                };
+
+                bool hasAny = false;
+                for (int i = 0; i < 3; ++i) if (t->hist.vs[i].games > 0) { hasAny = true; break; }
+
+                ImGui::Spacing();
+                if (showVsRace && hasAny)
+                    ImGui::TextDisabled(S(u8"최근 100경기 상대 종족별 승률", "Win rate by opp. race (last 100)"));
+                const char* hdrVs   = "vs";
+                const char* hdrGame = S(u8"경기", "Game");
+                const char* hdrWin  = S(u8"승률", "Win");
+                const char* hdrDisc = S(u8"디스", "Disconnect");
+                float pad = 6.f;
+                float wVs   = std::max(ImGui::CalcTextSize(hdrVs).x,   ImGui::CalcTextSize("Total").x) + pad;
+                float wGame = std::max(ImGui::CalcTextSize(hdrGame).x,  ImGui::CalcTextSize("9999").x)  + pad;
+                float wDisc = std::max(ImGui::CalcTextSize(hdrDisc).x,  ImGui::CalcTextSize("99.9%").x) + pad;
+
+                ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(3, 2));
+                // Total행: vs/Game/Win/Disconnect(4열), 종족행: vs/Game/Win(3열)
+                // 테이블은 4열 기준, 종족행은 Disconnect 열 비움
+                if (ImGui::BeginTable("##hist", 4,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX))
+                {
+                    ImGui::TableSetupColumn(hdrVs,   ImGuiTableColumnFlags_WidthFixed, wVs);
+                    ImGui::TableSetupColumn(hdrGame,  ImGuiTableColumnFlags_WidthFixed, wGame);
+                    ImGui::TableSetupColumn(hdrWin,   ImGuiTableColumnFlags_WidthFixed, 68);
+                    ImGui::TableSetupColumn(hdrDisc,  ImGuiTableColumnFlags_WidthFixed, wDisc);
+                    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+                    for (int col = 0; col < 4; col++) {
+                        ImGui::TableSetColumnIndex(col);
+                        const char* name = ImGui::TableGetColumnName(col);
+                        CellCenter(name);
+                        ImGui::TableHeader(name);
+                    }
+
+                    // Total 행 (흰색, Disconnect 포함)
+                    {
+                        float dcr = t->hist.DiscRate() * 100.f;
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        CellCenter("Total"); ImGui::Text("Total");
+
+                        ImGui::TableSetColumnIndex(1);
+                        char gStr[8]; snprintf(gStr, sizeof(gStr), "%d", t->hist.total);
+                        CellCenter(gStr); ImGui::Text("%s", gStr);
+
+                        ImGui::TableSetColumnIndex(2);
+                        char barLabel[16]; snprintf(barLabel, sizeof(barLabel), "%.0f%%", wr * 100.f);
+                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(1.f, 1.f, 1.f, 0.85f));
+                        ImGui::ProgressBar(wr, ImVec2(-1, 0), barLabel);
+                        ImGui::PopStyleColor();
+
+                        ImGui::TableSetColumnIndex(3);
+                        char dcStr[16]; snprintf(dcStr, sizeof(dcStr), "%.1f%%", dcr);
+                        ImVec4 dcCol = (dcr >= 10.f) ? ImVec4(1.f,0.3f,0.3f,1.f)
+                                     : (dcr >=  5.f) ? ImVec4(1.f,0.6f,0.1f,1.f)
+                                     :                 ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                        CellCenter(dcStr); ImGui::TextColored(dcCol, "%s", dcStr);
+                    }
+
+                    if (showVsRace) {
+                        for (int i = 0; i < 3; ++i) {
+                            int ri = kRaceOrder[i];
+                            const auto& vs = t->hist.vs[ri];
+                            if (vs.games == 0) continue;
+                            float vwr = vs.WinRate();
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            char lbl[4]; snprintf(lbl, sizeof(lbl), "%s", kRaceLabel[i]);
+                            CellCenter(lbl); ImGui::TextColored(kRaceColor[i], "%s", lbl);
+
+                            ImGui::TableSetColumnIndex(1);
+                            char gStr[8]; snprintf(gStr, sizeof(gStr), "%d", vs.games);
+                            CellCenter(gStr); ImGui::Text("%s", gStr);
+
+                            ImGui::TableSetColumnIndex(2);
+                            char barLabel[16]; snprintf(barLabel, sizeof(barLabel), "%.0f%%", vwr >= 0.f ? vwr * 100.f : 0.f);
+                            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kBarColor[i]);
+                            ImGui::ProgressBar(vwr >= 0.f ? vwr : 0.f, ImVec2(-1, 0), barLabel);
+                            ImGui::PopStyleColor();
+                            // col 3 (Disconnect): 종족별 행은 비움
+                        }
+                    }
+
+                    ImGui::EndTable();
+                }
+                ImGui::PopStyleVar();
             };
 
             // --- 자동 조회 결과 (게임 중 상대방) ---
@@ -1052,10 +1406,38 @@ static void RenderOverlay()
             }
             if (autoFetching)
                 ImGui::TextDisabled(S(u8"상대방 조회 중...", "Fetching stats..."));
-            else if (!g_isInGame && autoProfs.empty())
-                ImGui::TextDisabled(S(u8"게임 대기 중...", "Waiting for game..."));
-            for (auto& prof : autoProfs)
+            else if (!g_isInGame && autoProfs.empty()) {
+                // 로비: 내 전적 표시
+                bool selfFetching, selfFetched; DisplayProfile selfProf;
+                {
+                    std::lock_guard<std::mutex> lk(g_profileMutex);
+                    // 프로세스 바뀌면 재조회
+                    if (g_selfLastProcess != g_hProcess) {
+                        g_selfFetched  = false;
+                        g_selfFetching = false;
+                        g_selfLastProcess = g_hProcess;
+                    }
+                    selfFetching = g_selfFetching;
+                    selfFetched  = g_selfFetched;
+                    selfProf     = g_selfProfile;
+                    if (!selfFetched && !selfFetching && g_hProcess) {
+                        g_selfFetching = true;
+                        std::thread(FetchSelfProfile).detach();
+                    }
+                }
+                if (selfFetching)
+                    ImGui::TextDisabled(S(u8"내 전적 조회 중...", "Fetching my stats..."));
+                else if (selfFetched) {
+                    RenderProfileTable(selfProf);
+                    RenderHistCard(selfProf, true);
+                }
+                else
+                    ImGui::TextDisabled(S(u8"게임 대기 중...", "Waiting for game..."));
+            }
+            for (auto& prof : autoProfs) {
                 RenderProfileTable(prof);
+                RenderHistCard(prof, autoProfs.size() == 1);
+            }
 
 
         } // 전적 조회
@@ -1134,8 +1516,48 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DoExtraction();
             }).detach();
         }
+        if (g_wasInGame && !inGame) {
+            // 게임 종료 → 로비: 상대 전적 초기화 + 내 전적 재조회
+            std::lock_guard<std::mutex> lk(g_profileMutex);
+            g_autoProfiles.clear();
+            g_autoFetching = false;
+            g_selfFetched  = false;
+            g_selfFetching = false;
+        }
         g_wasInGame = inGame;
         g_isInGame  = inGame;
+
+        // 로비에서 ID 변경 감지:
+        // 평상시: 캐시 주소 1개만 읽음 (거의 무비용)
+        // 계정 전환 시: 캐시 주소가 무효화되면 백그라운드에서 전체 스캔 1회
+        if (!inGame && g_hProcess) {
+            ULONGLONG addr; bool fetched;
+            {
+                std::lock_guard<std::mutex> lk(g_profileMutex);
+                addr = g_selfToonAddr; fetched = g_selfFetched;
+            }
+            if (addr && fetched) {
+                const char myPfx[] = "HAT:"; size_t plen = strlen(myPfx);
+                std::string s = ReadNullTerminatedString(g_hProcess, addr);
+                if (s.compare(0, plen, myPfx) == 0) {
+                    // 주소 유효 - ID가 바뀌었는지 확인
+                    size_t e = s.find('\x10', plen);
+                    std::string curID = (e != std::string::npos && e > plen) ? s.substr(plen, e-plen) : s.substr(plen);
+                    if (!curID.empty()) {
+                        std::lock_guard<std::mutex> lk(g_profileMutex);
+                        if (!g_selfFetching && g_selfProfile.queryName != curID) {
+                            g_selfFetched = false; g_selfFetching = false; g_selfToonAddr = 0;
+                        }
+                    }
+                } else {
+                    // 주소 무효 (계정 전환으로 메모리 변경) → 백그라운드 전체 스캔 1회
+                    {
+                        std::lock_guard<std::mutex> lk(g_profileMutex);
+                        if (!g_selfFetching) { g_selfFetched = false; g_selfFetching = false; g_selfToonAddr = 0; }
+                    }
+                }
+            }
+        }
 
         if (g_fastJoin && g_hProcess) {
             if (IsCreateScreen()) DisableFastJoin();
@@ -1166,7 +1588,7 @@ void CreateOverlayWindow(HINSTANCE hInstance)
 
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     g_hOverlay = CreateWindowEx(
-        WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
         L"BW_OverlayWndClass", L"", WS_POPUP,
         0, 0, sw, sh, NULL, NULL, hInstance, NULL);
 
@@ -1358,10 +1780,9 @@ void WhisperScanThread()
 {
     while (true)
     {
-        // 게임 중엔 귓말이 거의 없으므로 스캔 중지
-        if (g_hProcess && g_whisperReply && !g_isInGame)
-            ScanWhisperSenderFromHeap();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (g_hProcess && g_whisperReply)
+            ScanWhisperSenderFromRingBuffer();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -1379,7 +1800,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             // F1: GUI 토글
             if (kb->vkCode == VK_F12 && (scFg || ovFg) && g_hOverlay)
             {
-                g_showGui = !g_showGui;
+                g_showGuiManual = !g_showGuiManual;
+                g_showGui = g_showGuiManual;
                 UpdateOverlayPosition();
                 RenderOverlay();
                 return 1;
@@ -1441,24 +1863,27 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_INITDIALOG:
-        CheckDlgButton(hDlg, IDC_SWAP_KEY,      g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,    g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS, g_autoShowStats       ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_FAST_JOIN,      g_fastJoin             ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_SWAP_KEY,        g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_IGNORE,      g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS,  g_autoShowStats         ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WHISPER_REPLY,    g_whisperReply          ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_FAST_JOIN,        g_fastJoin              ? BST_CHECKED : BST_UNCHECKED);
         if (!g_isKorean) {
             SetWindowTextW(hDlg, L"Settings");
-            SetDlgItemTextW(hDlg, IDC_SWAP_KEY,       L"Use Space bar as Control key");
-            SetDlgItemTextW(hDlg, IDC_AUTO_IGNORE,    L"Auto-ignore opponent's chat on game start");
-            SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS,L"Auto-display stats 5 seconds after game start");
-            SetDlgItemTextW(hDlg, IDC_STATIC,         L"You can change these settings anytime by right-clicking the system tray icon.");
+            SetDlgItemTextW(hDlg, IDC_SWAP_KEY,        L"Use Space bar as Control key");
+            SetDlgItemTextW(hDlg, IDC_AUTO_IGNORE,     L"Auto-ignore opponent's chat on game start");
+            SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS, L"Auto-display stats 5 seconds after game start");
+            SetDlgItemTextW(hDlg, IDC_WHISPER_REPLY,   L"Shift+Enter: Quick reply to last whisper");
+            SetDlgItemTextW(hDlg, IDC_STATIC,          L"You can change these settings anytime by right-clicking the system tray icon.");
         }
         return (INT_PTR)TRUE;
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK) {
-            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)       == BST_CHECKED;
-            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)      == BST_CHECKED;
+            g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)        == BST_CHECKED;
+            g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)     == BST_CHECKED;
             g_autoShowStats         = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
-            g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)        == BST_CHECKED;
+            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
+            g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)       == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }
