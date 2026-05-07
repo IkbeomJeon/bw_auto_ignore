@@ -220,6 +220,7 @@ static std::mutex    g_profileMutex;
 static bool g_showReplayViewer    = false;
 static RECT g_replayBtnScreenRect    = {};
 static RECT g_replayViewerScreenRect = {};
+static char g_manualToon[128]        = {}; // 수동 조회 입력 버퍼
 
 // ---------------------------------------------------------------------------
 // 리플레이 채팅 조회
@@ -1555,12 +1556,37 @@ static std::string RunScrep(const std::string& screpPath, const std::string& rep
     return result;
 }
 
+// 최상위 레벨의 string 값만 추출 (중첩 객체 내 동명 키 무시)
+// screp의 Player 객체는 "Type":{"Name":"Human",...} 이 먼저 나오므로
+// 일반 JsonStringVal로는 "Human"이 잡힘 → 깊이 1에서만 검색
+static std::string JsonTopLevelString(const std::string& obj, const std::string& key)
+{
+    std::string fk = "\"" + key + "\"";
+    int depth = 0;
+    for (size_t i = 0; i < obj.size(); i++) {
+        char c = obj[i];
+        if (c == '{' || c == '[') { depth++; continue; }
+        if (c == '}' || c == ']') { depth--; continue; }
+        if (depth == 1 && obj.compare(i, fk.size(), fk) == 0) {
+            size_t p = i + fk.size();
+            while (p < obj.size() && (obj[p]==' '||obj[p]=='\t'||obj[p]=='\n'||obj[p]=='\r'||obj[p]==':')) p++;
+            if (p < obj.size() && obj[p] == '"') {
+                p++;
+                size_t e = p;
+                while (e < obj.size() && obj[e] != '"') { if (obj[e]=='\\') e++; e++; }
+                return obj.substr(p, e - p);
+            }
+        }
+    }
+    return "";
+}
+
 // screp JSON에서 채팅 추출 → ReplayGame에 채워 넣기
 static void ParseScrepJson(const std::string& json, const std::string& toon, ReplayGame& game)
 {
     if (json.empty() || json[0] != '{') return;
 
-    // Players: SlotID → Name 맵
+    // Players: SlotID → Name 맵 (깊이 인식으로 올바른 Name 추출)
     std::map<int, std::string> slotToName;
     size_t playersPos = json.find("\"Players\"");
     if (playersPos != std::string::npos) {
@@ -1572,7 +1598,7 @@ static void ParseScrepJson(const std::string& json, const std::string& toon, Rep
             size_t oE = FindMatchingBrace(json, oS); if (oE == std::string::npos) break;
             std::string obj = json.substr(oS, oE - oS + 1);
             int slotId = JsonIntVal(obj, "SlotID");
-            std::string name = JsonStringVal(obj, "Name");
+            std::string name = JsonTopLevelString(obj, "Name"); // 최상위 Name만
             if (!name.empty()) slotToName[slotId] = name;
             cur = oE + 1;
         }
@@ -2137,7 +2163,7 @@ static void RenderOverlay()
                 RenderProfileTable(prof);
                 RenderHistCard(prof, autoProfs.size() == 1);
 
-                // 인게임 + 유효한 프로필에만 채팅 조회 버튼 표시
+                // 인게임 + 유효한 프로필에만 로드/보기 버튼 표시
                 if (g_isInGame && prof.valid) {
                     ReplayFetchStatus fetchSt;
                     std::string fetchToon;
@@ -2146,17 +2172,28 @@ static void RenderOverlay()
                         fetchSt   = g_replayFetch.status;
                         fetchToon = g_replayFetch.toon;
                     }
-                    bool isThis  = (fetchToon == prof.queryName);
-                    bool loading = isThis && (fetchSt == ReplayFetchStatus::LOADING_LIST ||
-                                             fetchSt == ReplayFetchStatus::DOWNLOADING  ||
-                                             fetchSt == ReplayFetchStatus::PARSING);
-                    char btnId[64]; snprintf(btnId, sizeof(btnId), S(u8"채팅 조회##%s", "Chat##%s"), prof.queryName.c_str());
-                    if (loading) ImGui::BeginDisabled();
-                    if (ImGui::Button(btnId, ImVec2(-1, 0))) {
-                        // 새 조회 시작
+                    bool isThis    = (fetchToon == prof.queryName);
+                    bool isLoading = (fetchSt == ReplayFetchStatus::LOADING_LIST ||
+                                      fetchSt == ReplayFetchStatus::DOWNLOADING  ||
+                                      fetchSt == ReplayFetchStatus::PARSING);
+                    bool isDone    = (isThis && fetchSt == ReplayFetchStatus::DONE);
+                    // 로드 버튼: 현재 로딩 중이거나 이미 이 toon이 완료면 비활성
+                    bool loadDis = isLoading || isDone;
+                    // 보기 버튼: 이 toon의 데이터가 완료된 경우만 활성
+                    bool showEn  = isDone;
+
+                    char loadId[80]; snprintf(loadId, sizeof(loadId), S(u8"로드##a%s", "Load##a%s"), prof.queryName.c_str());
+                    char showId[80]; snprintf(showId, sizeof(showId), S(u8"보기##a%s", "Show##a%s"), prof.queryName.c_str());
+                    float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+                    if (loadDis) ImGui::BeginDisabled();
+                    if (ImGui::Button(loadId, ImVec2(hw, 0))) {
+                        int gw = 30;
+                        for (auto& t : prof.toons)
+                            if (t.name == prof.queryName) { gw = t.gateway > 0 ? t.gateway : 30; break; }
                         {
                             std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
-                            g_replayFetch.toon    = prof.queryName;
+                            g_replayFetch.toon = prof.queryName;
                             g_replayFetch.gateway = 0;
                             g_replayFetch.status  = ReplayFetchStatus::LOADING_LIST;
                             g_replayFetch.statusMsg = "";
@@ -2164,15 +2201,16 @@ static void RenderOverlay()
                             g_replayFetch.dlDone = g_replayFetch.dlTotal = 0;
                             g_replayFetch.parseDone = g_replayFetch.parseTotal = 0;
                         }
-                        // 프로필에서 gateway 추출 (queryName 일치 toon)
-                        int gw = 30;
-                        for (auto& t : prof.toons)
-                            if (t.name == prof.queryName) { gw = t.gateway > 0 ? t.gateway : 30; break; }
-                        g_showReplayViewer = true;
                         std::string qn = prof.queryName;
                         std::thread([qn, gw]() { DoFetchReplayChat(qn, gw); }).detach();
                     }
-                    if (loading) ImGui::EndDisabled();
+                    if (loadDis) ImGui::EndDisabled();
+
+                    ImGui::SameLine();
+                    if (!showEn) ImGui::BeginDisabled();
+                    if (ImGui::Button(showId, ImVec2(hw, 0)))
+                        g_showReplayViewer = !g_showReplayViewer;
+                    if (!showEn) ImGui::EndDisabled();
                 }
             }
 
@@ -2205,6 +2243,56 @@ static void RenderOverlay()
                 }
                 ImGui::EndChild();
             }
+        }
+
+        // ============================================================
+        // 수동 조회 섹션
+        // ============================================================
+        ImGui::SeparatorText(S(u8"채팅 조회", "Chat Lookup"));
+        {
+            ReplayFetchStatus fetchSt; std::string fetchToon;
+            {
+                std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+                fetchSt  = g_replayFetch.status;
+                fetchToon = g_replayFetch.toon;
+            }
+            bool isLoading = (fetchSt == ReplayFetchStatus::LOADING_LIST ||
+                              fetchSt == ReplayFetchStatus::DOWNLOADING  ||
+                              fetchSt == ReplayFetchStatus::PARSING);
+            bool isDone    = (!fetchToon.empty() && fetchToon == g_manualToon
+                              && fetchSt == ReplayFetchStatus::DONE);
+
+            // 입력란 (붙여넣기 포함 — 훅에서 키 전달)
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText(S(u8"##수동아이디", "##manualid"), g_manualToon, sizeof(g_manualToon));
+
+            float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            bool loadDis = isLoading || isDone || (g_manualToon[0] == '\0');
+            bool showEn  = (!fetchToon.empty() && fetchToon == g_manualToon
+                            && fetchSt == ReplayFetchStatus::DONE);
+
+            if (loadDis) ImGui::BeginDisabled();
+            if (ImGui::Button(S(u8"로드##m", "Load##m"), ImVec2(hw, 0))) {
+                std::string qn = g_manualToon;
+                {
+                    std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+                    g_replayFetch.toon = qn;
+                    g_replayFetch.gateway = 0;
+                    g_replayFetch.status  = ReplayFetchStatus::LOADING_LIST;
+                    g_replayFetch.statusMsg = "";
+                    g_replayFetch.games.clear();
+                    g_replayFetch.dlDone = g_replayFetch.dlTotal = 0;
+                    g_replayFetch.parseDone = g_replayFetch.parseTotal = 0;
+                }
+                std::thread([qn]() { DoFetchReplayChat(qn, 30); }).detach();
+            }
+            if (loadDis) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (!showEn) ImGui::BeginDisabled();
+            if (ImGui::Button(S(u8"보기##m", "Show##m"), ImVec2(hw, 0)))
+                g_showReplayViewer = !g_showReplayViewer;
+            if (!showEn) ImGui::EndDisabled();
         }
 
         ImGui::End();
@@ -2698,6 +2786,31 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode == HC_ACTION)
     {
         KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+
+        // ImGui가 텍스트 입력 중이면 키보드 이벤트를 오버레이로 전달
+        // (WS_EX_NOACTIVATE로 포커스가 없어도 입력 가능하게)
+        if (g_hOverlay && g_imguiInitialized && ImGui::GetIO().WantTextInput) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                LPARAM lp = 1 | ((LPARAM)kb->scanCode << 16);
+                if (kb->flags & LLKHF_EXTENDED) lp |= (1 << 24);
+                PostMessage(g_hOverlay, (UINT)wParam, kb->vkCode, lp);
+                // 인쇄 가능한 문자는 WM_CHAR도 생성
+                BYTE ks[256] = {};
+                GetKeyboardState(ks);
+                wchar_t buf[8] = {};
+                int n = ToUnicode(kb->vkCode, kb->scanCode, ks, buf, 8, 0);
+                for (int i = 0; i < n; i++)
+                    PostMessage(g_hOverlay, WM_CHAR, buf[i], lp);
+                return 1; // SC로 전달 차단
+            }
+            if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+                LPARAM lp = 1 | ((LPARAM)kb->scanCode << 16) | (0xC0000000L);
+                if (kb->flags & LLKHF_EXTENDED) lp |= (1 << 24);
+                PostMessage(g_hOverlay, (UINT)wParam, kb->vkCode, lp);
+                return 1;
+            }
+        }
+
         HWND hFg = GetForegroundWindow();
         DWORD fgPID = 0; GetWindowThreadProcessId(hFg, &fgPID);
         bool scFg = (fgPID == g_starcraftPID), ovFg = (hFg == g_hOverlay);
