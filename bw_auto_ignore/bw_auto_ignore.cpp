@@ -212,6 +212,10 @@ static HANDLE        g_selfLastProcess = NULL;
 static ULONGLONG     g_selfToonAddr = 0;  // HAT: 문자열 주소 캐시 (재스캔 방지)
 static std::mutex    g_profileMutex;
 
+static bool g_showReplayViewer   = false;
+static RECT g_replayBtnScreenRect   = {};
+static RECT g_replayViewerScreenRect = {};
+
 // ---------------------------------------------------------------------------
 // 함수 선언
 // ---------------------------------------------------------------------------
@@ -1385,7 +1389,7 @@ static void RenderOverlay()
     if (!g_imguiInitialized || !g_pRenderTargetView) return;
 
     // 보여줄 내용이 없으면 Present 건너뜀 (GPU/DWM 부하 제거)
-    bool hasContent = g_showGui || (!g_mapName.empty() && g_isInGame);
+    bool hasContent = g_showGui || (!g_mapName.empty() && g_isInGame) || g_showReplayViewer;
     static bool s_lastHasContent = false;
     if (!hasContent && !s_lastHasContent) return;
     s_lastHasContent = hasContent;
@@ -1398,6 +1402,10 @@ static void RenderOverlay()
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+
+    // 인터랙티브 영역 리셋 (매 프레임 갱신)
+    g_replayBtnScreenRect    = {};
+    g_replayViewerScreenRect = {};
 
     // 설정 GUI
     if (g_showGui)
@@ -1714,36 +1722,98 @@ static void RenderOverlay()
             }
         }
 
+        // ============================================================
+        // 리플레이 조회 버튼
+        // ============================================================
+        ImGui::Separator();
+        const char* btnLabel = g_showReplayViewer
+            ? S(u8"리플레이 닫기", "Close Replay")
+            : S(u8"리플레이 조회", "Replay List");
+        if (ImGui::Button(btnLabel, ImVec2(-1, 0)))
+            g_showReplayViewer = !g_showReplayViewer;
+        {
+            ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            POINT o = {0, 0}; ClientToScreen(g_hOverlay, &o);
+            g_replayBtnScreenRect = { o.x + (LONG)mn.x, o.y + (LONG)mn.y,
+                                      o.x + (LONG)mx.x, o.y + (LONG)mx.y };
+        }
+
         ImGui::End();
     } // g_showGui
+
+    // ============================================================
+    // 리플레이 목록 뷰어 (별도 ImGui 창)
+    // ============================================================
+    if (g_showReplayViewer) {
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetNextWindowPos(
+            ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+            ImGuiCond_Once, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(520, 580), ImGuiCond_Once);
+        bool viewerOpen = true;
+        const char* viewerTitle = S(u8"리플레이 목록", "Replay List");
+        ImGui::Begin(viewerTitle, &viewerOpen, ImGuiWindowFlags_NoSavedSettings);
+        if (!viewerOpen) g_showReplayViewer = false;
+
+        ImGui::BeginChild("##rlist", ImVec2(0, 0), false);
+        ImGuiListClipper clipper;
+        clipper.Begin(1000);
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                char buf[80];
+                snprintf(buf, sizeof(buf),
+                    S(u8"[%04d] 리플레이 더미 데이터 #%d", "[%04d] Dummy Replay #%d"),
+                    row + 1, row + 1);
+                ImGui::Text("%s", buf);
+            }
+        }
+        clipper.End();
+        ImGui::EndChild();
+        ImGui::End();
+
+        // 뷰어 영역 화면 좌표 추적 (NCHITTEST용)
+        ImGuiWindow* vw = ImGui::FindWindowByName(viewerTitle);
+        if (vw && vw->Size.x > 0) {
+            POINT o = {0, 0}; ClientToScreen(g_hOverlay, &o);
+            g_replayViewerScreenRect = {
+                o.x + (LONG)vw->Pos.x,
+                o.y + (LONG)vw->Pos.y,
+                o.x + (LONG)(vw->Pos.x + vw->Size.x),
+                o.y + (LONG)(vw->Pos.y + vw->Size.y)
+            };
+        }
+    }
 
     ImGui::Render();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     g_pSwapChain->Present(0, 0);
 
-    // GUI 영역만 윈도우 리전으로 설정 (변경 시에만)
+    // GUI 영역만 윈도우 리전으로 설정
     // - 리전 밖: 윈도우가 존재하지 않음 → SC가 마우스/커서 직접 처리
-    // - 리전 안: HTTRANSPARENT → SC로 전달 (인터랙티브 요소 없으므로 문제없음)
+    // - 리전 안, HTTRANSPARENT: SC로 전달 / HTCLIENT: 오버레이가 처리
     {
-        static RECT s_lastRgn = {-2,-2,-2,-2};
-        RECT newRgn = {0,0,0,0};
-
+        HRGN combined = CreateRectRgn(0, 0, 0, 0); // 빈 시작
         if (g_showGui) {
             ImGuiWindow* w = ImGui::FindWindowByName(u8"SCR Scout");
             if (w && w->Size.x > 0) {
-                newRgn.left   = (LONG)w->Pos.x;
-                newRgn.top    = (LONG)w->Pos.y;
-                newRgn.right  = (LONG)(w->Pos.x + w->Size.x);
-                newRgn.bottom = (LONG)(w->Pos.y + w->Size.y);
+                HRGN r = CreateRectRgn((LONG)w->Pos.x, (LONG)w->Pos.y,
+                    (LONG)(w->Pos.x + w->Size.x), (LONG)(w->Pos.y + w->Size.y));
+                CombineRgn(combined, combined, r, RGN_OR);
+                DeleteObject(r);
             }
         }
-        // g_showGui==false 또는 창 없으면 newRgn={0,0,0,0} → 빈 리전
-
-        if (memcmp(&newRgn, &s_lastRgn, sizeof(RECT)) != 0) {
-            s_lastRgn = newRgn;
-            HRGN rgn = CreateRectRgn(newRgn.left, newRgn.top, newRgn.right, newRgn.bottom);
-            SetWindowRgn(g_hOverlay, rgn, FALSE);
+        if (g_showReplayViewer) {
+            const char* vname = S(u8"리플레이 목록", "Replay List");
+            ImGuiWindow* vw = ImGui::FindWindowByName(vname);
+            if (vw && vw->Size.x > 0) {
+                HRGN r = CreateRectRgn((LONG)vw->Pos.x, (LONG)vw->Pos.y,
+                    (LONG)(vw->Pos.x + vw->Size.x), (LONG)(vw->Pos.y + vw->Size.y));
+                CombineRgn(combined, combined, r, RGN_OR);
+                DeleteObject(r);
+            }
         }
+        SetWindowRgn(g_hOverlay, combined, FALSE);
+        // SetWindowRgn이 combined 소유권을 가져가므로 DeleteObject 불필요
     }
 }
 
@@ -1758,8 +1828,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
     case WM_MOUSEWHEEL:
         return 0; // 훅에서 전달된 휠 이벤트 - ImGui가 위에서 처리함
-    case WM_NCHITTEST:
-        return HTTRANSPARENT;  // 마우스 입력 항상 게임으로 통과
+    case WM_NCHITTEST: {
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        if (g_replayBtnScreenRect.right > g_replayBtnScreenRect.left &&
+            PtInRect(&g_replayBtnScreenRect, pt))
+            return HTCLIENT;
+        if (g_showReplayViewer &&
+            g_replayViewerScreenRect.right > g_replayViewerScreenRect.left &&
+            PtInRect(&g_replayViewerScreenRect, pt))
+            return HTCLIENT;
+        return HTTRANSPARENT;
+    }
     case WM_SIZE:
         if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
             CleanupRenderTarget();
