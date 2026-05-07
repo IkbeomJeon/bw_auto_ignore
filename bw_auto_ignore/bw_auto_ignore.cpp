@@ -1,4 +1,7 @@
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -6,6 +9,12 @@
 #pragma comment(lib, "psapi.lib")
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#define HAVE_REMOTE
+#include <pcap.h>
+#pragma comment(lib, "wpcap.lib")
+#pragma comment(lib, "Packet.lib")
 #include <d3d11.h>
 #include <dxgi.h>
 #pragma comment(lib, "d3d11.lib")
@@ -110,6 +119,22 @@ ULONGLONG g_scModuleBase = 0;
 
 HWND g_hOverlay = NULL;
 HWND g_hStarCraftWnd = NULL;
+HHOOK g_hMouseHook = NULL;
+
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && wParam == WM_MOUSEWHEEL && g_hOverlay) {
+        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
+        POINT pt = ms->pt;
+        RECT rc;
+        if (GetWindowRect(g_hOverlay, &rc) &&
+            pt.x >= rc.left && pt.x < rc.right &&
+            pt.y >= rc.top  && pt.y < rc.bottom) {
+            PostMessage(g_hOverlay, WM_MOUSEWHEEL,
+                MAKEWPARAM(0, (SHORT)HIWORD(ms->mouseData)), MAKELPARAM(pt.x, pt.y));
+        }
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+}
 WORD g_cachedApiPort = 0;
 std::wstring g_mapName = L"";
 
@@ -167,6 +192,19 @@ struct DisplayProfile {
 
 static std::vector<DisplayProfile> g_autoProfiles;
 static bool          g_autoFetching = false;
+
+// 상대방 IP (npcap 캡처)
+struct PeerIPInfo {
+    std::string ip;
+    std::string country;
+    std::string region;
+    std::string city;
+    std::string org;
+    bool fetched = false;
+};
+static std::vector<PeerIPInfo> g_peerIPs;
+static std::mutex              g_peerMutex;
+static bool                    g_pcapRunning = false;
 static DisplayProfile g_selfProfile;
 static bool          g_selfFetching = false;
 static bool          g_selfFetched  = false;
@@ -236,6 +274,212 @@ DWORD GetProcessID(const wchar_t* processName)
     }
     CloseHandle(snapshot);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// npcap UDP 6112 캡처
+// ---------------------------------------------------------------------------
+struct EthHeader  { uint8_t dst[6], src[6]; uint16_t type; };
+struct IPv4Header { uint8_t ver_ihl, tos; uint16_t len, id, frag; uint8_t ttl, proto; uint16_t cksum; uint32_t src, dst; };
+struct UDPHeader  { uint16_t sport, dport, len, cksum; };
+
+static bool IsPublicIP(uint32_t ip) {
+    uint8_t a = (ip >> 24) & 0xFF;
+    uint8_t b = (ip >> 16) & 0xFF;
+    uint8_t c = (ip >>  8) & 0xFF;
+    if (a == 0 || a == 10 || a == 127) return false;
+    if (a == 192 && b == 168) return false;
+    if (a == 172 && b >= 16 && b <= 31) return false;
+    if (a >= 224) return false;
+    // 블리자드 서버 대역 제외
+    if (a == 158 && b == 115 && c == 203) return false; // 블리자드 KR 게임서버
+    if (a == 137 && b == 221) return false;              // 블리자드 배틀넷
+    if (a == 117 && b ==  52) return false;              // 블리자드 KR
+    if (a ==  37 && b == 244) return false;              // 블리자드 STUN
+    if (a ==  59 && b == 153) return false;              // 블리자드 STUN Asia
+    if (a == 144 && b ==  95) return false;              // 블리자드 릴레이 EU
+    if (a ==  13) return false;                          // AWS (블리자드 CDN)
+    if (a ==  34) return false;                          // GCP (블리자드 CDN)
+    return true;
+}
+
+static void DbgLog(const char* fmt, ...) {
+    char path[MAX_PATH];
+    GetTempPathA(MAX_PATH, path);
+    strcat_s(path, "scr_debug.txt");
+    FILE* f = nullptr; fopen_s(&f, path, "a");
+    if (!f) return;
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+    fclose(f);
+}
+
+static void FetchIPInfo(std::string ip) {
+    // ipinfo.io/json/{ip} 호출
+    std::wstring wip(ip.begin(), ip.end());
+    std::wstring path = L"/" + wip;
+
+    HINTERNET hS = WinHttpOpen(L"SCRScout/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return;
+    HINTERNET hC = WinHttpConnect(hS, L"ipinfo.io", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hC) { WinHttpCloseHandle(hS); return; }
+    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hR) { WinHttpCloseHandle(hC); WinHttpCloseHandle(hS); return; }
+
+    std::string json;
+    BOOL sent = WinHttpSendRequest(hR, L"Accept: application/json\r\n", (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    BOOL rcvd = sent && WinHttpReceiveResponse(hR, NULL);
+    DWORD statusCode = 0, scLen = sizeof(statusCode);
+    if (rcvd) {
+        WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            NULL, &statusCode, &scLen, NULL);
+        DWORD sz = 0;
+        do {
+            if (!WinHttpQueryDataAvailable(hR, &sz) || !sz) break;
+            std::vector<char> b(sz+1, 0); DWORD rd = 0;
+            WinHttpReadData(hR, b.data(), sz, &rd);
+            json.append(b.data(), rd);
+        } while (sz > 0);
+    }
+    DWORD lastErr = GetLastError();
+    DbgLog("fetch: IP=%s sent=%d rcvd=%d status=%lu err=%lu json_len=%zu json=%.300s\n",
+        ip.c_str(), (int)sent, (int)rcvd, statusCode, lastErr, json.size(), json.c_str());
+    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+
+    auto extract = [&](const std::string& key) -> std::string {
+        std::string k = "\"" + key + "\"";
+        size_t p = json.find(k);
+        if (p == std::string::npos) return "";
+        p = json.find('"', p + k.size()); // 값의 첫 따옴표
+        if (p == std::string::npos) return "";
+        p++;
+        size_t e = json.find('"', p);
+        return e == std::string::npos ? "" : json.substr(p, e - p);
+    };
+
+    std::lock_guard<std::mutex> lk(g_peerMutex);
+    for (auto& info : g_peerIPs) {
+        if (info.ip == ip) {
+            info.country = extract("country");
+            info.region  = extract("region");
+            info.city    = extract("city");
+            info.org     = extract("org");
+            info.fetched = true;
+            break;
+        }
+    }
+}
+
+static void PcapPacketHandler(u_char*, const struct pcap_pkthdr* hdr, const u_char* pkt) {
+    if (hdr->caplen < sizeof(EthHeader) + sizeof(IPv4Header) + sizeof(UDPHeader)) return;
+    auto* eth = (EthHeader*)pkt;
+    if (ntohs(eth->type) != 0x0800) return; // IPv4만
+    auto* ip  = (IPv4Header*)(pkt + sizeof(EthHeader));
+    if (ip->proto != 17) return; // UDP만
+    auto* udp = (UDPHeader*)(pkt + sizeof(EthHeader) + sizeof(IPv4Header));
+    uint16_t sp = ntohs(udp->sport), dp = ntohs(udp->dport);
+    // 로컬 포트 6112로 오가는 트래픽 → 상대방은 반대쪽
+    bool toLocal   = (dp == 6112); // 상대→나: remote는 src
+    bool fromLocal = (sp == 6112); // 나→상대: remote는 dst
+    if (!toLocal && !fromLocal) return;
+
+    uint32_t remote = toLocal ? ntohl(ip->src) : ntohl(ip->dst);
+    uint32_t remoteRaw = toLocal ? ip->src : ip->dst;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+        (remote >> 24) & 0xFF, (remote >> 16) & 0xFF,
+        (remote >> 8)  & 0xFF,  remote & 0xFF);
+
+    DbgLog("pkt: sp=%u dp=%u remote=%s public=%d\n", sp, dp, buf, (int)IsPublicIP(remote));
+
+    if (!IsPublicIP(remote)) return;
+
+    {
+        std::lock_guard<std::mutex> lk(g_peerMutex);
+        for (auto& info : g_peerIPs)
+            if (info.ip == buf) return; // 이미 있음
+        g_peerIPs.push_back({buf});
+    }
+    std::thread(FetchIPInfo, std::string(buf)).detach();
+}
+
+static void PcapCaptureOnDev(std::string devName) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_live(devName.c_str(), 65536, 0, 100, errbuf);
+    if (!handle) return;
+    struct bpf_program fp;
+    pcap_compile(handle, &fp, "udp port 6112", 1, PCAP_NETMASK_UNKNOWN);
+    pcap_setfilter(handle, &fp);
+    pcap_freecode(&fp);
+    while (g_pcapRunning)
+        pcap_dispatch(handle, 32, PcapPacketHandler, nullptr);
+    pcap_close(handle);
+}
+
+static void StartPcapCapture() {
+    if (g_pcapRunning) return;
+    g_pcapRunning = true;
+    std::thread([]() {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        pcap_if_t* alldevs = nullptr;
+        if (pcap_findalldevs(&alldevs, errbuf) != 0 || !alldevs) {
+            g_pcapRunning = false; return;
+        }
+        // loopback 제외 모든 어댑터에서 캡처
+        std::vector<std::string> devNames;
+        for (pcap_if_t* d = alldevs; d; d = d->next) {
+            if (!(d->flags & PCAP_IF_LOOPBACK))
+                devNames.push_back(d->name);
+        }
+        pcap_freealldevs(alldevs);
+        // 각 어댑터마다 스레드
+        for (size_t i = 1; i < devNames.size(); i++)
+            std::thread(PcapCaptureOnDev, devNames[i]).detach();
+        if (!devNames.empty())
+            PcapCaptureOnDev(devNames[0]); // 첫 번째는 현재 스레드
+        g_pcapRunning = false;
+    }).detach();
+}
+
+static void StopPcapCapture() {
+    g_pcapRunning = false;
+}
+
+// SC 프로세스가 연결된 IP 목록 반환 (TCP ESTABLISHED 기준)
+std::vector<std::string> GetSCConnectedIPs()
+{
+    std::vector<std::string> result;
+    if (!g_starcraftPID) return result;
+
+    DWORD size = 0;
+    GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0) return result;
+
+    std::vector<BYTE> buf(size);
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+        return result;
+
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    std::set<std::string> seen;
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        auto& row = table->table[i];
+        if (row.dwOwningPid != g_starcraftPID) continue;
+        if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
+        DWORD ip = row.dwRemoteAddr;
+        char ipStr[32];
+        snprintf(ipStr, sizeof(ipStr), "%lu.%lu.%lu.%lu",
+            ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+        DWORD remotePort = ((row.dwRemotePort & 0xFF) << 8) | ((row.dwRemotePort >> 8) & 0xFF);
+        // 로컬호스트, HTTPS(443) 제외
+        if (row.dwRemoteAddr == 0x0100007F) continue; // 127.0.0.1
+        if (remotePort == 443) continue;
+        char full[64]; snprintf(full, sizeof(full), "%s:%lu", ipStr, remotePort);
+        if (seen.insert(full).second)
+            result.push_back(full);
+    }
+    return result;
 }
 
 ULONGLONG GetStarCraftModuleBase()
@@ -1442,6 +1686,34 @@ static void RenderOverlay()
 
         } // 전적 조회
 
+        // ============================================================
+        // 상대방 IP (npcap)
+        // ============================================================
+        ImGui::SeparatorText(S(u8"상대 IP", "Peer IPs"));
+        {
+            std::vector<PeerIPInfo> ips;
+            { std::lock_guard<std::mutex> lk(g_peerMutex); ips = g_peerIPs; }
+            if (ips.empty()) {
+                ImGui::TextDisabled(S(u8"없음", "None"));
+            } else {
+                ImGui::BeginChild("##peerips", ImVec2(0, 120), false, ImGuiWindowFlags_HorizontalScrollbar);
+                for (auto& info : ips) {
+                    ImGui::TextUnformatted(info.ip.c_str());
+                    if (!info.fetched) {
+                        ImGui::SameLine(); ImGui::TextDisabled("...");
+                    } else {
+                        char loc[128];
+                        snprintf(loc, sizeof(loc), "  %s / %s / %s",
+                            info.country.c_str(), info.region.c_str(), info.city.c_str());
+                        ImGui::TextDisabled("%s", loc);
+                        if (!info.org.empty())
+                            ImGui::TextDisabled("  %s", info.org.c_str());
+                    }
+                }
+                ImGui::EndChild();
+            }
+        }
+
         ImGui::End();
     } // g_showGui
 
@@ -1480,8 +1752,12 @@ static void RenderOverlay()
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
     switch (msg)
     {
+    case WM_MOUSEWHEEL:
+        return 0; // 훅에서 전달된 휠 이벤트 - ImGui가 위에서 처리함
     case WM_NCHITTEST:
         return HTTRANSPARENT;  // 마우스 입력 항상 게임으로 통과
     case WM_SIZE:
@@ -1495,6 +1771,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
         bool inGame = IsInGame();
         if (!g_wasInGame && inGame) {
+            { std::lock_guard<std::mutex> lk(g_peerMutex); g_peerIPs.clear(); }
             { std::lock_guard<std::mutex> lk(g_mutex); g_extractedSet.clear(); }
             // 상대방 전적 자동 조회
             {
@@ -1517,6 +1794,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }).detach();
         }
         if (g_wasInGame && !inGame) {
+            // 게임 종료 → 로비: IP 목록 초기화
+            { std::lock_guard<std::mutex> lk(g_peerMutex); g_peerIPs.clear(); }
             // 게임 종료 → 로비: 상대 전적 초기화 + 내 전적 재조회
             std::lock_guard<std::mutex> lk(g_profileMutex);
             g_autoProfiles.clear();
@@ -1630,6 +1909,7 @@ void CreateOverlayWindow(HINSTANCE hInstance)
 
     ImGui_ImplWin32_Init(g_hOverlay);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dContext);
+    g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, NULL, 0);
     g_imguiInitialized = true;
 
     SetTimer(g_hOverlay, 1, 200, NULL);
@@ -1967,6 +2247,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
     std::thread(ProcessMonitorThread).detach();
     std::thread(WhisperScanThread).detach();
+    StartPcapCapture();
 
     DialogBox(hInst, MAKEINTRESOURCE(IDD_SETTING_DIALOG), nid.hWnd, SettingDlgProc);
 
@@ -1976,6 +2257,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     StopKeyboardHook();
     DisableFastJoin();
     if (g_imguiInitialized) {
+        if (g_hMouseHook) { UnhookWindowsHookEx(g_hMouseHook); g_hMouseHook = NULL; }
         ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
     }
     if (g_pRenderTargetView) g_pRenderTargetView->Release();

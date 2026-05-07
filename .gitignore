@@ -404,3 +404,6 @@ FodyWeavers.xsd
 .venv/
 tools/snaps/
 dist/*.lnk
+promo.md
+promo.txt
+npcap-sdk/
