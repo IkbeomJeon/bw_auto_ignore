@@ -35,6 +35,11 @@
 #include <mutex>
 #include <iterator>
 #include <map>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <fstream>
+#include <sstream>
 #include "resource.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -212,9 +217,38 @@ static HANDLE        g_selfLastProcess = NULL;
 static ULONGLONG     g_selfToonAddr = 0;  // HAT: 문자열 주소 캐시 (재스캔 방지)
 static std::mutex    g_profileMutex;
 
-static bool g_showReplayViewer   = false;
-static RECT g_replayBtnScreenRect   = {};
+static bool g_showReplayViewer    = false;
+static RECT g_replayBtnScreenRect    = {};
 static RECT g_replayViewerScreenRect = {};
+
+// ---------------------------------------------------------------------------
+// 리플레이 채팅 조회
+// ---------------------------------------------------------------------------
+struct ReplayChatLine {
+    std::string time;    // "MM:SS"
+    std::string sender;
+    std::string msg;
+    bool isTarget = false;
+};
+struct ReplayGame {
+    std::string filename;   // rep 파일명
+    std::string opponent;   // 상대방 이름
+    std::string timestamp;  // "YYYYMMDD_HHMMSS"
+    std::string result;     // win/loss/disconnect
+    std::vector<ReplayChatLine> lines;
+};
+enum class ReplayFetchStatus { IDLE, LOADING_LIST, DOWNLOADING, PARSING, DONE, FETCH_ERROR };
+struct ReplayFetchState {
+    std::string              toon;
+    int                      gateway = 0;
+    ReplayFetchStatus        status  = ReplayFetchStatus::IDLE;
+    std::string              statusMsg;
+    std::atomic<int>         dlDone{0}, dlTotal{0};
+    std::atomic<int>         parseDone{0}, parseTotal{0};
+    std::vector<ReplayGame>  games;   // newest first
+    std::mutex               mtx;
+};
+static ReplayFetchState g_replayFetch;
 
 // ---------------------------------------------------------------------------
 // 함수 선언
@@ -1382,6 +1416,419 @@ static void FetchSelfProfile()
 }
 
 // ---------------------------------------------------------------------------
+// 리플레이 채팅 조회 구현
+// ---------------------------------------------------------------------------
+
+// screp.exe 경로 찾기
+static std::string FindScrepExe()
+{
+    // 1) 실행파일 옆
+    char selfPath[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string dir = selfPath;
+    size_t sl = dir.rfind('\\');
+    if (sl != std::string::npos) dir = dir.substr(0, sl + 1);
+    std::string cand = dir + "screp.exe";
+    if (GetFileAttributesA(cand.c_str()) != INVALID_FILE_ATTRIBUTES) return cand;
+    // 2) fallback
+    const char* fb = "C:\\wd\\screp_python\\screp.exe";
+    if (GetFileAttributesA(fb) != INVALID_FILE_ATTRIBUTES) return fb;
+    return "";
+}
+
+// WinHTTP HTTPS GET (임의 호스트)
+static std::string HttpsGet(const std::wstring& host, const std::wstring& path,
+                            const std::wstring& extraHeaders = L"")
+{
+    HINTERNET hS = WinHttpOpen(L"SCRScout/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return "";
+    WinHttpSetTimeouts(hS, 10000, 10000, 20000, 20000);
+    HINTERNET hC = WinHttpConnect(hS, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hC) { WinHttpCloseHandle(hS); return ""; }
+    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", path.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hR) { WinHttpCloseHandle(hC); WinHttpCloseHandle(hS); return ""; }
+
+    const wchar_t* hdrs = extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extraHeaders.c_str();
+    DWORD hdrLen = extraHeaders.empty() ? 0 : (DWORD)-1L;
+    std::string result;
+    if (WinHttpSendRequest(hR, hdrs, hdrLen, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hR, NULL)) {
+        DWORD sz = 0;
+        do {
+            if (!WinHttpQueryDataAvailable(hR, &sz) || !sz) break;
+            std::vector<char> b(sz + 1, 0); DWORD rd = 0;
+            WinHttpReadData(hR, b.data(), sz, &rd);
+            result.append(b.data(), rd);
+        } while (sz > 0);
+    }
+    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+    return result;
+}
+
+// URL에서 파일 다운로드 (HTTP/HTTPS 자동 판별)
+static bool DownloadFile(const std::string& url, const std::string& outPath)
+{
+    // URL 파싱
+    bool isHttps = (url.find("https://") == 0);
+    std::string rest = url.substr(isHttps ? 8 : 7);
+    size_t pathStart = rest.find('/');
+    std::string hostStr = (pathStart != std::string::npos) ? rest.substr(0, pathStart) : rest;
+    std::string pathStr = (pathStart != std::string::npos) ? rest.substr(pathStart) : "/";
+
+    int whl = MultiByteToWideChar(CP_UTF8, 0, hostStr.c_str(), -1, NULL, 0);
+    std::wstring wHost(whl, 0); MultiByteToWideChar(CP_UTF8, 0, hostStr.c_str(), -1, &wHost[0], whl);
+    int wpl = MultiByteToWideChar(CP_UTF8, 0, pathStr.c_str(), -1, NULL, 0);
+    std::wstring wPath(wpl, 0); MultiByteToWideChar(CP_UTF8, 0, pathStr.c_str(), -1, &wPath[0], wpl);
+
+    HINTERNET hS = WinHttpOpen(L"SCRScout/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return false;
+    WinHttpSetTimeouts(hS, 10000, 10000, 30000, 30000);
+    INTERNET_PORT port = isHttps ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+    DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hC = WinHttpConnect(hS, wHost.c_str(), port, 0);
+    if (!hC) { WinHttpCloseHandle(hS); return false; }
+    HINTERNET hR = WinHttpOpenRequest(hC, L"GET", wPath.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hR) { WinHttpCloseHandle(hC); WinHttpCloseHandle(hS); return false; }
+
+    bool ok = false;
+    if (WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hR, NULL)) {
+        DWORD status = 0, ssz = sizeof(status);
+        WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            NULL, &status, &ssz, NULL);
+        if (status == 200) {
+            std::vector<char> data;
+            DWORD sz = 0;
+            do {
+                if (!WinHttpQueryDataAvailable(hR, &sz) || !sz) break;
+                size_t off = data.size(); data.resize(off + sz);
+                DWORD rd = 0; WinHttpReadData(hR, data.data() + off, sz, &rd);
+                data.resize(off + rd);
+            } while (sz > 0);
+            if (!data.empty()) {
+                FILE* f = nullptr; fopen_s(&f, outPath.c_str(), "wb");
+                if (f) { fwrite(data.data(), 1, data.size(), f); fclose(f); ok = true; }
+            }
+        }
+    }
+    WinHttpCloseHandle(hR); WinHttpCloseHandle(hC); WinHttpCloseHandle(hS);
+    return ok;
+}
+
+// screp.exe 실행 → stdout 캡처
+static std::string RunScrep(const std::string& screpPath, const std::string& repPath)
+{
+    // 파이프 생성
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    SECURITY_ATTRIBUTES sa = {}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "";
+
+    // 자식 프로세스가 읽기 끝을 상속하지 않도록
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    std::string cmd = "\"" + screpPath + "\" -cmds \"" + repPath + "\"";
+    STARTUPINFOA si = {}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError  = hWritePipe;
+    PROCESS_INFORMATION pi = {};
+
+    std::string result;
+    if (CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, TRUE,
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hWritePipe); hWritePipe = NULL;
+        char buf[4096];
+        DWORD rd = 0;
+        while (ReadFile(hReadPipe, buf, sizeof(buf), &rd, NULL) && rd > 0)
+            result.append(buf, rd);
+        WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+    if (hWritePipe) CloseHandle(hWritePipe);
+    CloseHandle(hReadPipe);
+    return result;
+}
+
+// screp JSON에서 채팅 추출 → ReplayGame에 채워 넣기
+static void ParseScrepJson(const std::string& json, const std::string& toon, ReplayGame& game)
+{
+    if (json.empty() || json[0] != '{') return;
+
+    // Players: SlotID → Name 맵
+    std::map<int, std::string> slotToName;
+    size_t playersPos = json.find("\"Players\"");
+    if (playersPos != std::string::npos) {
+        size_t arr = json.find('[', playersPos);
+        size_t arrEnd = FindMatchingBrace(json, arr);
+        size_t cur = arr + 1;
+        while (cur < arrEnd) {
+            size_t oS = json.find('{', cur); if (oS == std::string::npos || oS >= arrEnd) break;
+            size_t oE = FindMatchingBrace(json, oS); if (oE == std::string::npos) break;
+            std::string obj = json.substr(oS, oE - oS + 1);
+            int slotId = JsonIntVal(obj, "SlotID");
+            std::string name = JsonStringVal(obj, "Name");
+            if (!name.empty()) slotToName[slotId] = name;
+            cur = oE + 1;
+        }
+    }
+
+    // ChatCmds
+    size_t cmdsPos = json.find("\"ChatCmds\"");
+    if (cmdsPos == std::string::npos) return;
+    size_t arr = json.find('[', cmdsPos);
+    if (arr == std::string::npos) return;
+    size_t arrEnd = FindMatchingBrace(json, arr);
+    if (arrEnd == std::string::npos) return;
+
+    auto framesToTime = [](int frames) -> std::string {
+        int s = (int)(frames / 23.81);
+        char buf[8]; snprintf(buf, sizeof(buf), "%02d:%02d", s / 60, s % 60);
+        return buf;
+    };
+
+    size_t cur = arr + 1;
+    while (cur < arrEnd) {
+        size_t oS = json.find('{', cur); if (oS == std::string::npos || oS >= arrEnd) break;
+        size_t oE = FindMatchingBrace(json, oS); if (oE == std::string::npos) break;
+        std::string obj = json.substr(oS, oE - oS + 1);
+
+        int frame     = JsonIntVal(obj, "Frame");
+        int slotId    = JsonIntVal(obj, "SenderSlotID");
+        std::string msg = JsonStringVal(obj, "Message");
+
+        if (!msg.empty()) {
+            auto it = slotToName.find(slotId);
+            std::string sender = (it != slotToName.end()) ? it->second : "";
+            ReplayChatLine cl;
+            cl.time     = framesToTime(frame);
+            cl.sender   = sender;
+            cl.msg      = msg;
+            cl.isTarget = (sender == toon);
+            game.lines.push_back(cl);
+        }
+        cur = oE + 1;
+    }
+}
+
+// Supabase에서 리플레이 목록 조회 (특정 게이트웨이)
+static const char* SUPABASE_HOST_U8 = "xmploueumzkrdvapbyfs.supabase.co";
+static const char* SUPABASE_ANON    =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhtcGxvdWV1bXprcmR2YXBieWZzIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NzI4ODY5MTQsImV4cCI6MTk4ODQ2MjkxNH0"
+    ".p8Jkm2fnFzzy7YYdCs0NVjBdqLmUzvBFJjdf3V0bHuo";
+
+struct ReplayRecord {
+    std::string id, timestamp, replayUrl, opponentAlias, result;
+};
+
+static std::vector<ReplayRecord> FetchReplayList(const std::string& toon, int gateway, int count = 100)
+{
+    std::vector<ReplayRecord> results;
+    // URL 인코딩 (이름에 공백/특수문자 대응)
+    std::string encodedToon;
+    for (unsigned char c : toon) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') encodedToon += c;
+        else { char esc[4]; snprintf(esc, sizeof(esc), "%%%02X", c); encodedToon += esc; }
+    }
+
+    int offset = 0;
+    while ((int)results.size() < count) {
+        int batch = std::min(100, count - (int)results.size());
+        std::string path =
+            "/rest/v1/player_matches_distinct_v2"
+            "?alias=eq."    + encodedToon +
+            "&gateway=eq."  + std::to_string(gateway) +
+            "&replay_url=not.is.null"
+            "&order=timestamp.desc"
+            "&limit="       + std::to_string(batch) +
+            "&offset="      + std::to_string(offset) +
+            "&select=id,timestamp,replay_url,opponent_alias,result";
+
+        int wpl = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+        std::wstring wPath(wpl, 0); MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wPath[0], wpl);
+        std::wstring hdrs = L"apikey: ";
+        int wal = MultiByteToWideChar(CP_UTF8, 0, SUPABASE_ANON, -1, NULL, 0);
+        std::wstring wAnon(wal, 0); MultiByteToWideChar(CP_UTF8, 0, SUPABASE_ANON, -1, &wAnon[0], wal);
+        hdrs += wAnon + L"\r\nAuthorization: Bearer " + wAnon + L"\r\n";
+
+        std::string json = HttpsGet(L"xmploueumzkrdvapbyfs.supabase.co", wPath, hdrs);
+        if (json.empty() || json[0] != '[') break;
+
+        // JSON 배열 파싱
+        size_t cur = 1;
+        int pageCount = 0;
+        while (cur < json.size()) {
+            size_t oS = json.find('{', cur); if (oS == std::string::npos) break;
+            size_t oE = FindMatchingBrace(json, oS); if (oE == std::string::npos) break;
+            std::string obj = json.substr(oS, oE - oS + 1);
+            ReplayRecord r;
+            r.id           = JsonStringVal(obj, "id");
+            r.timestamp    = JsonStringVal(obj, "timestamp");
+            r.replayUrl    = JsonStringVal(obj, "replay_url");
+            r.opponentAlias= JsonStringVal(obj, "opponent_alias");
+            r.result       = JsonStringVal(obj, "result");
+            if (!r.replayUrl.empty()) results.push_back(r);
+            cur = oE + 1; pageCount++;
+        }
+        if (pageCount < batch) break;
+        offset += pageCount;
+    }
+    return results;
+}
+
+// 백그라운드: 리플레이 다운로드 + 채팅 파싱 (병렬)
+static void DoFetchReplayChat(std::string toon, int gateway)
+{
+    auto setMsg = [&](ReplayFetchStatus st, const std::string& msg) {
+        std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+        g_replayFetch.status    = st;
+        g_replayFetch.statusMsg = msg;
+    };
+
+    // screp 위치 확인
+    std::string screpPath = FindScrepExe();
+    if (screpPath.empty()) {
+        setMsg(ReplayFetchStatus::FETCH_ERROR, S("screp.exe 없음 (scr_scout.exe 옆에 두세요)", "screp.exe not found"));
+        return;
+    }
+
+    // 임시 폴더
+    char tmp[MAX_PATH]; GetTempPathA(MAX_PATH, tmp);
+    std::string baseDir = std::string(tmp) + "scrscout\\";
+    CreateDirectoryA(baseDir.c_str(), NULL);
+    std::string outDir = baseDir + toon + "\\";
+    CreateDirectoryA(outDir.c_str(), NULL);
+
+    // ── 1. 리플레이 목록 조회 (게이트웨이 fallback) ──────────────────────────
+    setMsg(ReplayFetchStatus::LOADING_LIST, S("목록 조회 중...", "Fetching list..."));
+    std::vector<ReplayRecord> records;
+    const int gwOrder[] = { gateway, 30, 20, 10, 11, 12 };
+    int usedGw = gateway;
+    for (int gw : gwOrder) {
+        if (gw == 0) continue;
+        bool dup = false;
+        for (int prev : gwOrder) { if (prev == gw && prev != gwOrder[0]) { dup = true; break; } }
+        // 첫 번째(=감지된 gw) 이외엔 이미 시도한 gw 중복 체크
+        records = FetchReplayList(toon, gw, 100);
+        if (!records.empty()) { usedGw = gw; break; }
+    }
+    if (records.empty()) {
+        setMsg(ReplayFetchStatus::FETCH_ERROR, S("리플레이 없음 (cwal.gg 미등록)", "No replays found"));
+        return;
+    }
+
+    // ── 2. 병렬 다운로드 (최대 8 워커) ──────────────────────────────────────
+    int total = (int)records.size();
+    g_replayFetch.dlTotal  = total;
+    g_replayFetch.dlDone   = 0;
+    setMsg(ReplayFetchStatus::DOWNLOADING, "");
+
+    // 다운로드된 파일 경로 (index → path, 실패면 "")
+    std::vector<std::string> repPaths(total);
+    {
+        std::mutex qMtx;
+        std::queue<int> workQ;
+        for (int i = 0; i < total; i++) workQ.push(i);
+
+        auto worker = [&]() {
+            while (true) {
+                int idx;
+                { std::lock_guard<std::mutex> lk(qMtx);
+                  if (workQ.empty()) return;
+                  idx = workQ.front(); workQ.pop(); }
+
+                auto& rec = records[idx];
+                // 파일명: "001_20231225_120000_win_vs_opp_ABCD1234.rep"
+                std::string ts = rec.timestamp.size() >= 19
+                    ? rec.timestamp.substr(0,10) + "_" + rec.timestamp.substr(11,8)
+                    : rec.timestamp;
+                for (char& c : ts) if (c==':' || c=='-' || c=='T') c = '_';
+                std::string rid = rec.id.size() >= 11 ? rec.id.substr(3, 8) : rec.id;
+                char fname[256];
+                snprintf(fname, sizeof(fname), "%03d_%s_%s_vs_%s_%s.rep",
+                    idx + 1, ts.c_str(), rec.result.c_str(),
+                    rec.opponentAlias.c_str(), rid.c_str());
+                // 특수문자 제거
+                for (int ci = 0; fname[ci]; ci++) {
+                    char c = fname[ci];
+                    if (c=='/'||c=='\\'||c=='*'||c=='?'||c=='"'||c=='<'||c=='>') fname[ci]='_';
+                }
+                std::string outPath = outDir + fname;
+
+                bool ok = true;
+                if (GetFileAttributesA(outPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+                    ok = DownloadFile(rec.replayUrl, outPath);
+                if (ok) repPaths[idx] = outPath;
+                g_replayFetch.dlDone++;
+            }
+        };
+
+        const int DL_WORKERS = 8;
+        std::vector<std::thread> threads;
+        for (int i = 0; i < std::min(DL_WORKERS, total); i++)
+            threads.emplace_back(worker);
+        for (auto& t : threads) t.join();
+    }
+
+    // ── 3. 병렬 screp 파싱 (최대 6 워커) ────────────────────────────────────
+    g_replayFetch.parseTotal = total;
+    g_replayFetch.parseDone  = 0;
+    setMsg(ReplayFetchStatus::PARSING, "");
+
+    std::vector<ReplayGame> games(total);
+    // 게임 메타데이터 미리 채우기
+    for (int i = 0; i < total; i++) {
+        games[i].opponent  = records[i].opponentAlias;
+        games[i].timestamp = records[i].timestamp;
+        games[i].result    = records[i].result;
+        games[i].filename  = repPaths[i].empty() ? "" :
+            repPaths[i].substr(repPaths[i].rfind('\\') + 1);
+    }
+    {
+        std::mutex qMtx;
+        std::queue<int> workQ;
+        for (int i = 0; i < total; i++)
+            if (!repPaths[i].empty()) workQ.push(i);
+
+        auto worker = [&]() {
+            while (true) {
+                int idx;
+                { std::lock_guard<std::mutex> lk(qMtx);
+                  if (workQ.empty()) return;
+                  idx = workQ.front(); workQ.pop(); }
+                std::string json = RunScrep(screpPath, repPaths[idx]);
+                ParseScrepJson(json, toon, games[idx]);
+                g_replayFetch.parseDone++;
+            }
+        };
+
+        const int PARSE_WORKERS = 6;
+        std::vector<std::thread> threads;
+        int qSize = 0;
+        { std::lock_guard<std::mutex> lk(qMtx); qSize = (int)workQ.size(); }
+        for (int i = 0; i < std::min(PARSE_WORKERS, qSize); i++)
+            threads.emplace_back(worker);
+        for (auto& t : threads) t.join();
+    }
+
+    // ── 4. 완료 ─────────────────────────────────────────────────────────────
+    int chatGames = 0;
+    for (auto& g : games) if (!g.lines.empty()) chatGames++;
+
+    std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+    g_replayFetch.games     = std::move(games);
+    g_replayFetch.status    = ReplayFetchStatus::DONE;
+    g_replayFetch.statusMsg = "";
+    g_replayFetch.gateway   = usedGw;
+}
+
+// ---------------------------------------------------------------------------
 // imgui 렌더링
 // ---------------------------------------------------------------------------
 static void RenderOverlay()
@@ -1689,6 +2136,44 @@ static void RenderOverlay()
             for (auto& prof : autoProfs) {
                 RenderProfileTable(prof);
                 RenderHistCard(prof, autoProfs.size() == 1);
+
+                // 인게임 + 유효한 프로필에만 채팅 조회 버튼 표시
+                if (g_isInGame && prof.valid) {
+                    ReplayFetchStatus fetchSt;
+                    std::string fetchToon;
+                    {
+                        std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+                        fetchSt   = g_replayFetch.status;
+                        fetchToon = g_replayFetch.toon;
+                    }
+                    bool isThis  = (fetchToon == prof.queryName);
+                    bool loading = isThis && (fetchSt == ReplayFetchStatus::LOADING_LIST ||
+                                             fetchSt == ReplayFetchStatus::DOWNLOADING  ||
+                                             fetchSt == ReplayFetchStatus::PARSING);
+                    char btnId[64]; snprintf(btnId, sizeof(btnId), S(u8"채팅 조회##%s", "Chat##%s"), prof.queryName.c_str());
+                    if (loading) ImGui::BeginDisabled();
+                    if (ImGui::Button(btnId, ImVec2(-1, 0))) {
+                        // 새 조회 시작
+                        {
+                            std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+                            g_replayFetch.toon    = prof.queryName;
+                            g_replayFetch.gateway = 0;
+                            g_replayFetch.status  = ReplayFetchStatus::LOADING_LIST;
+                            g_replayFetch.statusMsg = "";
+                            g_replayFetch.games.clear();
+                            g_replayFetch.dlDone = g_replayFetch.dlTotal = 0;
+                            g_replayFetch.parseDone = g_replayFetch.parseTotal = 0;
+                        }
+                        // 프로필에서 gateway 추출 (queryName 일치 toon)
+                        int gw = 30;
+                        for (auto& t : prof.toons)
+                            if (t.name == prof.queryName) { gw = t.gateway > 0 ? t.gateway : 30; break; }
+                        g_showReplayViewer = true;
+                        std::string qn = prof.queryName;
+                        std::thread([qn, gw]() { DoFetchReplayChat(qn, gw); }).detach();
+                    }
+                    if (loading) ImGui::EndDisabled();
+                }
             }
 
 
@@ -1722,52 +2207,104 @@ static void RenderOverlay()
             }
         }
 
-        // ============================================================
-        // 리플레이 조회 버튼
-        // ============================================================
-        ImGui::Separator();
-        const char* btnLabel = g_showReplayViewer
-            ? S(u8"리플레이 닫기", "Close Replay")
-            : S(u8"리플레이 조회", "Replay List");
-        if (ImGui::Button(btnLabel, ImVec2(-1, 0)))
-            g_showReplayViewer = !g_showReplayViewer;
-        {
-            ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-            POINT o = {0, 0}; ClientToScreen(g_hOverlay, &o);
-            g_replayBtnScreenRect = { o.x + (LONG)mn.x, o.y + (LONG)mn.y,
-                                      o.x + (LONG)mx.x, o.y + (LONG)mx.y };
-        }
-
         ImGui::End();
     } // g_showGui
 
     // ============================================================
-    // 리플레이 목록 뷰어 (별도 ImGui 창)
+    // 리플레이 채팅 뷰어 (별도 ImGui 창)
     // ============================================================
     if (g_showReplayViewer) {
+        // 상태 스냅샷
+        ReplayFetchStatus fetchSt; std::string fetchToon, fetchMsg;
+        int dlDone, dlTotal, parseDone, parseTotal;
+        static std::vector<ReplayGame> s_viewGames;
+        static ReplayFetchStatus s_lastSt = ReplayFetchStatus::IDLE;
+        static std::string s_lastToon;
+        {
+            std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+            fetchSt    = g_replayFetch.status;
+            fetchToon  = g_replayFetch.toon;
+            fetchMsg   = g_replayFetch.statusMsg;
+            dlDone     = g_replayFetch.dlDone;
+            dlTotal    = g_replayFetch.dlTotal;
+            parseDone  = g_replayFetch.parseDone;
+            parseTotal = g_replayFetch.parseTotal;
+            // 완료 시점에만 게임 데이터 복사 (매 프레임 복사 방지)
+            if ((fetchSt == ReplayFetchStatus::DONE || fetchSt == ReplayFetchStatus::FETCH_ERROR)
+                && (fetchSt != s_lastSt || fetchToon != s_lastToon)) {
+                s_viewGames = g_replayFetch.games;
+                s_lastSt   = fetchSt;
+                s_lastToon = fetchToon;
+            }
+        }
+
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextWindowPos(
             ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
             ImGuiCond_Once, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(520, 580), ImGuiCond_Once);
+        ImGui::SetNextWindowSize(ImVec2(560, 620), ImGuiCond_Once);
         bool viewerOpen = true;
-        const char* viewerTitle = S(u8"리플레이 목록", "Replay List");
+        const char* viewerTitle = S(u8"리플레이 채팅", "Replay Chat");
         ImGui::Begin(viewerTitle, &viewerOpen, ImGuiWindowFlags_NoSavedSettings);
         if (!viewerOpen) g_showReplayViewer = false;
 
-        ImGui::BeginChild("##rlist", ImVec2(0, 0), false);
-        ImGuiListClipper clipper;
-        clipper.Begin(1000);
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                char buf[80];
-                snprintf(buf, sizeof(buf),
-                    S(u8"[%04d] 리플레이 더미 데이터 #%d", "[%04d] Dummy Replay #%d"),
-                    row + 1, row + 1);
-                ImGui::Text("%s", buf);
-            }
+        // 헤더
+        if (!fetchToon.empty()) {
+            ImGui::TextColored(ImVec4(1,0.85f,0,1), S(u8"대상: %s", "Target: %s"), fetchToon.c_str());
+            ImGui::SameLine();
         }
-        clipper.End();
+
+        // 진행 상태
+        if (fetchSt == ReplayFetchStatus::LOADING_LIST) {
+            ImGui::TextDisabled(S(u8"목록 조회 중...", "Fetching list..."));
+        } else if (fetchSt == ReplayFetchStatus::DOWNLOADING) {
+            char prog[64]; snprintf(prog, sizeof(prog),
+                S(u8"다운로드 중... (%d/%d)", "Downloading... (%d/%d)"), dlDone, dlTotal);
+            ImGui::TextDisabled("%s", prog);
+            if (dlTotal > 0)
+                ImGui::ProgressBar((float)dlDone / dlTotal, ImVec2(-1, 6));
+        } else if (fetchSt == ReplayFetchStatus::PARSING) {
+            char prog[64]; snprintf(prog, sizeof(prog),
+                S(u8"채팅 파싱 중... (%d/%d)", "Parsing... (%d/%d)"), parseDone, parseTotal);
+            ImGui::TextDisabled("%s", prog);
+            if (parseTotal > 0)
+                ImGui::ProgressBar((float)parseDone / parseTotal, ImVec2(-1, 6));
+        } else if (fetchSt == ReplayFetchStatus::FETCH_ERROR) {
+            ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "%s", fetchMsg.c_str());
+        } else if (fetchSt == ReplayFetchStatus::DONE) {
+            int chatGames = 0;
+            for (auto& g : s_viewGames) if (!g.lines.empty()) chatGames++;
+            ImGui::TextDisabled(S(u8"완료: %d게임 / 채팅 %d게임", "Done: %d games / chat in %d"),
+                (int)s_viewGames.size(), chatGames);
+        } else {
+            ImGui::TextDisabled(S(u8"대기 중", "Idle"));
+        }
+        ImGui::Separator();
+
+        // 채팅 목록 (newest first = s_viewGames 순서대로)
+        ImGui::BeginChild("##chatscroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+        for (auto& game : s_viewGames) {
+            if (game.lines.empty()) continue;
+            // 게임 헤더
+            char hdr[256];
+            std::string ts = game.timestamp.size() >= 16
+                ? game.timestamp.substr(0,10) + " " + game.timestamp.substr(11,5) : game.timestamp;
+            snprintf(hdr, sizeof(hdr), S(u8"── %s vs %s [%s] %s ──",
+                                         "── %s vs %s [%s] %s ──"),
+                fetchToon.c_str(), game.opponent.c_str(), game.result.c_str(), ts.c_str());
+            ImGui::TextColored(ImVec4(0.55f,0.55f,0.55f,1), "%s", hdr);
+            // 채팅 라인
+            for (auto& cl : game.lines) {
+                char line[512];
+                snprintf(line, sizeof(line), "[%s] %s: %s",
+                    cl.time.c_str(), cl.sender.c_str(), cl.msg.c_str());
+                if (cl.isTarget)
+                    ImGui::TextColored(ImVec4(1,1,0,1), "%s", line);
+                else
+                    ImGui::TextUnformatted(line);
+            }
+            ImGui::Spacing();
+        }
         ImGui::EndChild();
         ImGui::End();
 
@@ -1803,7 +2340,7 @@ static void RenderOverlay()
             }
         }
         if (g_showReplayViewer) {
-            const char* vname = S(u8"리플레이 목록", "Replay List");
+            const char* vname = S(u8"리플레이 채팅", "Replay Chat");
             ImGuiWindow* vw = ImGui::FindWindowByName(vname);
             if (vw && vw->Size.x > 0) {
                 HRGN r = CreateRectRgn((LONG)vw->Pos.x, (LONG)vw->Pos.y,
@@ -1829,10 +2366,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_MOUSEWHEEL:
         return 0; // 훅에서 전달된 휠 이벤트 - ImGui가 위에서 처리함
     case WM_NCHITTEST: {
+        // 오버레이 ImGui 창 또는 뷰어 창 영역 내 → HTCLIENT (클릭 수신)
+        // 그 외 → HTTRANSPARENT (StarCraft로 통과)
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
-        if (g_replayBtnScreenRect.right > g_replayBtnScreenRect.left &&
-            PtInRect(&g_replayBtnScreenRect, pt))
-            return HTCLIENT;
+        // 메인 오버레이 창 영역
+        if (g_showGui) {
+            RECT rc; GetWindowRect(g_hOverlay, &rc);
+            ImGuiWindow* w = ImGui::FindWindowByName(u8"SCR Scout");
+            if (w && w->Size.x > 0) {
+                POINT o = {0,0}; ClientToScreen(g_hOverlay, &o);
+                RECT wr = { o.x+(LONG)w->Pos.x, o.y+(LONG)w->Pos.y,
+                            o.x+(LONG)(w->Pos.x+w->Size.x), o.y+(LONG)(w->Pos.y+w->Size.y) };
+                if (PtInRect(&wr, pt)) return HTCLIENT;
+            }
+        }
+        // 뷰어 창 영역
         if (g_showReplayViewer &&
             g_replayViewerScreenRect.right > g_replayViewerScreenRect.left &&
             PtInRect(&g_replayViewerScreenRect, pt))
