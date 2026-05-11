@@ -111,6 +111,7 @@ NOTIFYICONDATA nid = { 0 };
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
 bool g_autoShowStats = true;   // 게임 시작 후 10초간 전적 오버레이 자동 표시
+bool g_autoFetchChatOnGameStart = false; // 게임 시작 시 채팅 자동 조회
 bool g_showGuiManual = false;  // F12로 수동 활성화 여부
 bool g_whisperReply = true;    // Shift+Enter: 귓말 발신자에게 /w 입력
 
@@ -220,7 +221,6 @@ static std::mutex    g_profileMutex;
 static bool g_showReplayViewer    = false;
 static RECT g_replayBtnScreenRect    = {};
 static RECT g_replayViewerScreenRect = {};
-static char g_manualToon[128]        = {}; // 수동 조회 입력 버퍼
 
 // ---------------------------------------------------------------------------
 // 리플레이 채팅 조회
@@ -1354,6 +1354,8 @@ if (!name.empty() && guid > 0) guidMap[guid] = {name, gw};
     return result;
 }
 
+static void DoFetchReplayChat(std::string toon, int gateway); // 전방 선언
+
 // 게임 시작 시 상대방 자동 조회 (스레드에서 호출)
 static void AutoFetchOpponents()
 {
@@ -1383,6 +1385,37 @@ static void AutoFetchOpponents()
             std::this_thread::sleep_for(std::chrono::seconds(10));
             if (!g_showGuiManual) g_showGui = false;
         }).detach();
+    }
+
+    // 게임 시작 시 채팅 자동 조회 (로드만, show는 사용자가 직접)
+    if (g_autoFetchChatOnGameStart && !results.empty()) {
+        std::string opToon = results[0].queryName;
+        int opGw = 30; // 기본값; DoFetchReplayChat 내부에서 gateway fallback 처리
+        // 이미 같은 toon 로딩 중이면 스킵
+        bool skip = false;
+        {
+            std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+            auto st = g_replayFetch.status;
+            if (g_replayFetch.toon == opToon &&
+                (st == ReplayFetchStatus::LOADING_LIST ||
+                 st == ReplayFetchStatus::DOWNLOADING  ||
+                 st == ReplayFetchStatus::PARSING      ||
+                 st == ReplayFetchStatus::DONE))
+                skip = true;
+        }
+        if (!skip) {
+            {
+                std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
+                g_replayFetch.toon      = opToon;
+                g_replayFetch.gateway   = opGw;
+                g_replayFetch.status    = ReplayFetchStatus::LOADING_LIST;
+                g_replayFetch.statusMsg = "";
+                g_replayFetch.games.clear();
+                g_replayFetch.dlDone = g_replayFetch.dlTotal = 0;
+                g_replayFetch.parseDone = g_replayFetch.parseTotal = 0;
+            }
+            std::thread([opToon, opGw]() { DoFetchReplayChat(opToon, opGw); }).detach();
+        }
     }
 }
 
@@ -2227,7 +2260,17 @@ static void RenderOverlay()
             if (ips.empty()) {
                 ImGui::TextDisabled(S(u8"없음", "None"));
             } else {
-                ImGui::BeginChild("##peerips", ImVec2(0, 120), false, ImGuiWindowFlags_HorizontalScrollbar);
+                float lineH = ImGui::GetTextLineHeightWithSpacing();
+                float ipsH = 0;
+                for (auto& info : ips) {
+                    ipsH += lineH;
+                    if (info.fetched) {
+                        ipsH += lineH;
+                        if (!info.org.empty()) ipsH += lineH;
+                    }
+                }
+                ipsH = std::min(ipsH + 4.f, 150.f);
+                ImGui::BeginChild("##peerips", ImVec2(0, ipsH), false, ImGuiWindowFlags_HorizontalScrollbar);
                 for (auto& info : ips) {
                     ImGui::TextUnformatted(info.ip.c_str());
                     if (!info.fetched) {
@@ -2245,55 +2288,7 @@ static void RenderOverlay()
             }
         }
 
-        // ============================================================
-        // 수동 조회 섹션
-        // ============================================================
-        ImGui::SeparatorText(S(u8"채팅 조회", "Chat Lookup"));
-        {
-            ReplayFetchStatus fetchSt; std::string fetchToon;
-            {
-                std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
-                fetchSt  = g_replayFetch.status;
-                fetchToon = g_replayFetch.toon;
-            }
-            bool isLoading = (fetchSt == ReplayFetchStatus::LOADING_LIST ||
-                              fetchSt == ReplayFetchStatus::DOWNLOADING  ||
-                              fetchSt == ReplayFetchStatus::PARSING);
-            bool isDone    = (!fetchToon.empty() && fetchToon == g_manualToon
-                              && fetchSt == ReplayFetchStatus::DONE);
 
-            // 입력란 (붙여넣기 포함 — 훅에서 키 전달)
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputText(S(u8"##수동아이디", "##manualid"), g_manualToon, sizeof(g_manualToon));
-
-            float hw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-            bool loadDis = isLoading || isDone || (g_manualToon[0] == '\0');
-            bool showEn  = (!fetchToon.empty() && fetchToon == g_manualToon
-                            && fetchSt == ReplayFetchStatus::DONE);
-
-            if (loadDis) ImGui::BeginDisabled();
-            if (ImGui::Button(S(u8"로드##m", "Load##m"), ImVec2(hw, 0))) {
-                std::string qn = g_manualToon;
-                {
-                    std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
-                    g_replayFetch.toon = qn;
-                    g_replayFetch.gateway = 0;
-                    g_replayFetch.status  = ReplayFetchStatus::LOADING_LIST;
-                    g_replayFetch.statusMsg = "";
-                    g_replayFetch.games.clear();
-                    g_replayFetch.dlDone = g_replayFetch.dlTotal = 0;
-                    g_replayFetch.parseDone = g_replayFetch.parseTotal = 0;
-                }
-                std::thread([qn]() { DoFetchReplayChat(qn, 30); }).detach();
-            }
-            if (loadDis) ImGui::EndDisabled();
-
-            ImGui::SameLine();
-            if (!showEn) ImGui::BeginDisabled();
-            if (ImGui::Button(S(u8"보기##m", "Show##m"), ImVec2(hw, 0)))
-                g_showReplayViewer = !g_showReplayViewer;
-            if (!showEn) ImGui::EndDisabled();
-        }
 
         ImGui::End();
     } // g_showGui
@@ -2451,6 +2446,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return true;
     switch (msg)
     {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+        RenderOverlay(); // WantTextInput 즉시 갱신 (Ctrl+V 지연 방지)
+        return 0;
     case WM_MOUSEWHEEL:
         return 0; // 훅에서 전달된 휠 이벤트 - ImGui가 위에서 처리함
     case WM_NCHITTEST: {
@@ -2822,6 +2821,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             {
                 g_showGuiManual = !g_showGuiManual;
                 g_showGui = g_showGuiManual;
+                if (!g_showGui) g_showReplayViewer = false; // 오버레이 숨길 때 채팅창도 닫기
                 UpdateOverlayPosition();
                 RenderOverlay();
                 return 1;
@@ -2864,6 +2864,7 @@ void SaveSettings() {
     v = g_autoShowStats;         RegSetValueExW(hKey, L"AutoShowStats",          0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_whisperReply;          RegSetValueExW(hKey, L"WhisperReply",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_fastJoin;              RegSetValueExW(hKey, L"FastJoin",               0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_autoFetchChatOnGameStart; RegSetValueExW(hKey, L"AutoFetchChatOnGameStart", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
 
@@ -2875,7 +2876,8 @@ void LoadSettings() {
     if (RegQueryValueExW(hKey, L"AutoIgnoreOnGameStart",  NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoIgnoreOnGameStart  = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"AutoShowStats",          NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoShowStats          = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0; sz = sizeof(DWORD);
-    if (RegQueryValueExW(hKey, L"FastJoin",               NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_fastJoin               = v != 0;
+    if (RegQueryValueExW(hKey, L"FastJoin",               NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_fastJoin               = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"AutoFetchChatOnGameStart", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoFetchChatOnGameStart = v != 0;
     RegCloseKey(hKey);
 }
 
@@ -2885,15 +2887,18 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_INITDIALOG:
         CheckDlgButton(hDlg, IDC_SWAP_KEY,        g_swapSpaceAndControl   ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_AUTO_IGNORE,      g_autoIgnoreOnGameStart ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS,  g_autoShowStats         ? BST_CHECKED : BST_UNCHECKED);
-        CheckDlgButton(hDlg, IDC_WHISPER_REPLY,    g_whisperReply          ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_SHOW_STATS,   g_autoShowStats              ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_AUTO_FETCH_CHAT,  g_autoFetchChatOnGameStart   ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_WHISPER_REPLY,    g_whisperReply               ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_FAST_JOIN,        g_fastJoin              ? BST_CHECKED : BST_UNCHECKED);
         if (!g_isKorean) {
             SetWindowTextW(hDlg, L"Settings");
             SetDlgItemTextW(hDlg, IDC_SWAP_KEY,        L"Use Space bar as Control key");
             SetDlgItemTextW(hDlg, IDC_AUTO_IGNORE,     L"Auto-ignore opponent's chat on game start");
-            SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS, L"Auto-display stats 5 seconds after game start");
-            SetDlgItemTextW(hDlg, IDC_WHISPER_REPLY,   L"Shift+Enter: Quick reply to last whisper");
+            SetDlgItemTextW(hDlg, IDC_AUTO_SHOW_STATS,  L"Auto-display stats 5 seconds after game start");
+            SetDlgItemTextW(hDlg, IDC_AUTO_FETCH_CHAT,  L"Auto-load replay chat on game start");
+            SetDlgItemTextW(hDlg, IDC_WHISPER_REPLY,    L"Shift+Enter: Quick reply to last whisper");
+            SetDlgItemTextW(hDlg, IDC_FAST_JOIN,        L"Quick join public games");
             SetDlgItemTextW(hDlg, IDC_STATIC,          L"You can change these settings anytime by right-clicking the system tray icon.");
         }
         return (INT_PTR)TRUE;
@@ -2901,8 +2906,9 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
         if (LOWORD(wParam) == IDOK) {
             g_swapSpaceAndControl   = IsDlgButtonChecked(hDlg, IDC_SWAP_KEY)        == BST_CHECKED;
             g_autoIgnoreOnGameStart = IsDlgButtonChecked(hDlg, IDC_AUTO_IGNORE)     == BST_CHECKED;
-            g_autoShowStats         = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
-            g_whisperReply          = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
+            g_autoShowStats              = IsDlgButtonChecked(hDlg, IDC_AUTO_SHOW_STATS) == BST_CHECKED;
+            g_autoFetchChatOnGameStart   = IsDlgButtonChecked(hDlg, IDC_AUTO_FETCH_CHAT) == BST_CHECKED;
+            g_whisperReply               = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
             g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)       == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }

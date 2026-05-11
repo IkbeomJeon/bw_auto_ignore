@@ -22,6 +22,7 @@
 #define IDC_FAST_JOIN              1008
 #define IDC_WHISPER_REPLY          1009
 #define IDC_AUTO_SHOW_STATS        1010
+#define IDC_AUTO_FETCH_CHAT        1011
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
