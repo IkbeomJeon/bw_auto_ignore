@@ -47,6 +47,8 @@
 #include "imgui_impl_dx11.h"
 #include <shlobj.h>
 #pragma comment(lib, "shell32.lib")
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -110,13 +112,16 @@ NOTIFYICONDATA nid = { 0 };
 
 bool g_swapSpaceAndControl = false;
 bool g_autoIgnoreOnGameStart = false;
-bool g_autoShowStats = true;   // 게임 시작 후 10초간 전적 오버레이 자동 표시
+bool g_autoShowStats = true;   // 게임 시작 후 5초 대기, 5초간 전적 오버레이 자동 표시
 bool g_autoFetchChatOnGameStart = false; // 게임 시작 시 채팅 자동 조회
 bool g_showGuiManual = false;  // F12로 수동 활성화 여부
 bool g_whisperReply = true;    // Shift+Enter: 귓말 발신자에게 /w 입력
 
 std::string g_cachedWhisperSender;
 std::mutex  g_whisperMutex;
+bool g_muteOtherAudio = false; // Pause 키: 외부 오디오 음소거
+bool g_detectBadManner = false; // 비매너 사용자 검출
+bool g_otherAudioMuted = false; // 현재 외부 오디오 음소거 상태
 bool g_fastJoin = false;      // 공개방 빠른 입장 (현재 비활성)
 bool g_fastJoinActive = false;
 bool g_isInGame = false;
@@ -250,6 +255,72 @@ struct ReplayFetchState {
     std::mutex               mtx;
 };
 static ReplayFetchState g_replayFetch;
+static bool g_bmDetected = false; // 비매너 채팅 검출 결과
+
+// 비속어 필터 로드 (exe 경로의 "비속어 필터.txt")
+static std::vector<std::string> LoadProfanityFilter()
+{
+    std::vector<std::string> words;
+    char selfPath[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string dir = selfPath;
+    size_t sl = dir.rfind('\\');
+    if (sl != std::string::npos) dir = dir.substr(0, sl + 1);
+    std::string path = dir + "\xeb\xb9\x84\xec\x86\x8d\xec\x96\xb4 \xed\x95\x84\xed\x84\xb0.txt"; // "비속어 필터.txt" UTF-8
+
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "rb");
+    if (!f) return words;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    std::string buf(sz, '\0');
+    fread(&buf[0], 1, sz, f);
+    fclose(f);
+    // BOM 제거
+    if (buf.size() >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF)
+        buf = buf.substr(3);
+    // 쉼표로 분리
+    size_t start = 0;
+    while (start < buf.size()) {
+        size_t end = buf.find(',', start);
+        if (end == std::string::npos) end = buf.size();
+        std::string w = buf.substr(start, end - start);
+        // trim whitespace/newlines
+        while (!w.empty() && (w.front() == ' ' || w.front() == '\r' || w.front() == '\n')) w.erase(w.begin());
+        while (!w.empty() && (w.back() == ' ' || w.back() == '\r' || w.back() == '\n')) w.pop_back();
+        if (!w.empty()) words.push_back(w);
+        start = end + 1;
+    }
+    return words;
+}
+
+// ── 비매너 검출 파라미터 ──
+static constexpr float BM_PROFANITY_RATIO = 0.30f; // 채팅 있는 게임 중 욕설 게임 비율 임계값
+
+// 비매너 검사: 채팅 있는 게임 중 30% 이상에서 조회 대상이 욕설 사용 → 검출
+static bool CheckBadManner(const std::vector<ReplayGame>& games)
+{
+    std::vector<std::string> filter = LoadProfanityFilter();
+    if (filter.empty()) return false;
+
+    int chatGames = 0;
+    int profanityGames = 0;
+
+    for (auto& game : games) {
+        if (game.lines.empty()) continue;
+        chatGames++;
+
+        for (auto& cl : game.lines) {
+            if (!cl.isTarget) continue;
+            bool found = false;
+            for (auto& w : filter) {
+                if (cl.msg.find(w) != std::string::npos) { found = true; break; }
+            }
+            if (found) { profanityGames++; break; }
+        }
+    }
+
+    return chatGames > 0 && (float)profanityGames / chatGames >= BM_PROFANITY_RATIO;
+}
 
 // ---------------------------------------------------------------------------
 // 함수 선언
@@ -1380,9 +1451,11 @@ static void AutoFetchOpponents()
     }
 
     if (g_autoShowStats && !results.empty() && !g_showGuiManual) {
-        g_showGui = true;
         std::thread([]() {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (g_showGuiManual) return;
+            g_showGui = true;
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             if (!g_showGuiManual) g_showGui = false;
         }).detach();
     }
@@ -1417,6 +1490,63 @@ static void AutoFetchOpponents()
             std::thread([opToon, opGw]() { DoFetchReplayChat(opToon, opGw); }).detach();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pause 키: StarCraft 외 모든 오디오 세션 mute/unmute 토글
+// ---------------------------------------------------------------------------
+static void ToggleMuteOtherAudio()
+{
+    bool newMute = !g_otherAudioMuted;
+    CoInitialize(NULL);
+
+    IMMDeviceEnumerator* pEnum = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnum);
+    if (FAILED(hr) || !pEnum) { CoUninitialize(); return; }
+
+    IMMDevice* pDevice = nullptr;
+    hr = pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+    if (FAILED(hr) || !pDevice) { pEnum->Release(); CoUninitialize(); return; }
+
+    IAudioSessionManager2* pMgr = nullptr;
+    hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&pMgr);
+    if (FAILED(hr) || !pMgr) { pDevice->Release(); pEnum->Release(); CoUninitialize(); return; }
+
+    IAudioSessionEnumerator* pSessions = nullptr;
+    hr = pMgr->GetSessionEnumerator(&pSessions);
+    if (FAILED(hr) || !pSessions) { pMgr->Release(); pDevice->Release(); pEnum->Release(); CoUninitialize(); return; }
+
+    int count = 0;
+    pSessions->GetCount(&count);
+    for (int i = 0; i < count; i++) {
+        IAudioSessionControl* pCtl = nullptr;
+        if (FAILED(pSessions->GetSession(i, &pCtl)) || !pCtl) continue;
+
+        IAudioSessionControl2* pCtl2 = nullptr;
+        if (SUCCEEDED(pCtl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pCtl2))) {
+            DWORD pid = 0;
+            pCtl2->GetProcessId(&pid);
+            // StarCraft PID가 아니고 시스템 사운드(pid==0)도 아닌 세션만 mute
+            if (pid != 0 && pid != g_starcraftPID) {
+                ISimpleAudioVolume* pVol = nullptr;
+                if (SUCCEEDED(pCtl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&pVol))) {
+                    pVol->SetMute(newMute, NULL);
+                    pVol->Release();
+                }
+            }
+            pCtl2->Release();
+        }
+        pCtl->Release();
+    }
+
+    pSessions->Release();
+    pMgr->Release();
+    pDevice->Release();
+    pEnum->Release();
+    CoUninitialize();
+
+    g_otherAudioMuted = newMute;
 }
 
 static void FetchSelfProfile()
@@ -1880,11 +2010,15 @@ static void DoFetchReplayChat(std::string toon, int gateway)
     int chatGames = 0;
     for (auto& g : games) if (!g.lines.empty()) chatGames++;
 
+    // 비매너 검사 (lock 잡기 전에 수행)
+    bool bm = g_detectBadManner ? CheckBadManner(games) : false;
+
     std::lock_guard<std::mutex> lk(g_replayFetch.mtx);
     g_replayFetch.games     = std::move(games);
     g_replayFetch.status    = ReplayFetchStatus::DONE;
     g_replayFetch.statusMsg = "";
     g_replayFetch.gateway   = usedGw;
+    g_bmDetected = bm;
 }
 
 // ---------------------------------------------------------------------------
@@ -2359,6 +2493,8 @@ static void RenderOverlay()
             for (auto& g : s_viewGames) if (!g.lines.empty()) chatGames++;
             ImGui::TextDisabled(S(u8"완료: %d게임 / 채팅 %d게임", "Done: %d games / chat in %d"),
                 (int)s_viewGames.size(), chatGames);
+            if (g_detectBadManner && g_bmDetected)
+                ImGui::TextColored(ImVec4(1.f, 0.2f, 0.2f, 1.f), S(u8"⚠ 비매너 채팅 검출", "⚠ Bad manner chat detected"));
         } else {
             ImGui::TextDisabled(S(u8"대기 중", "Idle"));
         }
@@ -2826,6 +2962,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
                 RenderOverlay();
                 return 1;
             }
+            if ((scFg || ovFg) && g_muteOtherAudio && kb->vkCode == VK_PAUSE) {
+                std::thread(ToggleMuteOtherAudio).detach();
+                return 1;
+            }
             if (scFg) {
                 if (kb->vkCode == KEY_IGNORE)    { std::thread(DoExtraction).detach(); }
                 if (kb->vkCode == KEY_UNIGNORE)  { std::thread(DoRemoval).detach(); }
@@ -2865,6 +3005,8 @@ void SaveSettings() {
     v = g_whisperReply;          RegSetValueExW(hKey, L"WhisperReply",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_fastJoin;              RegSetValueExW(hKey, L"FastJoin",               0, REG_DWORD, (BYTE*)&v, sizeof(v));
     v = g_autoFetchChatOnGameStart; RegSetValueExW(hKey, L"AutoFetchChatOnGameStart", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_muteOtherAudio;           RegSetValueExW(hKey, L"MuteOtherAudio",           0, REG_DWORD, (BYTE*)&v, sizeof(v));
+    v = g_detectBadManner;          RegSetValueExW(hKey, L"DetectBadManner",          0, REG_DWORD, (BYTE*)&v, sizeof(v));
     RegCloseKey(hKey);
 }
 
@@ -2877,7 +3019,9 @@ void LoadSettings() {
     if (RegQueryValueExW(hKey, L"AutoShowStats",          NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoShowStats          = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"WhisperReply",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_whisperReply           = v != 0; sz = sizeof(DWORD);
     if (RegQueryValueExW(hKey, L"FastJoin",               NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_fastJoin               = v != 0; sz = sizeof(DWORD);
-    if (RegQueryValueExW(hKey, L"AutoFetchChatOnGameStart", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoFetchChatOnGameStart = v != 0;
+    if (RegQueryValueExW(hKey, L"AutoFetchChatOnGameStart", NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_autoFetchChatOnGameStart = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"MuteOtherAudio",           NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_muteOtherAudio           = v != 0; sz = sizeof(DWORD);
+    if (RegQueryValueExW(hKey, L"DetectBadManner",          NULL, NULL, (BYTE*)&v, &sz) == ERROR_SUCCESS) g_detectBadManner          = v != 0;
     RegCloseKey(hKey);
 }
 
@@ -2891,6 +3035,8 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
         CheckDlgButton(hDlg, IDC_AUTO_FETCH_CHAT,  g_autoFetchChatOnGameStart   ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_WHISPER_REPLY,    g_whisperReply               ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hDlg, IDC_FAST_JOIN,        g_fastJoin              ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_MUTE_OTHER_AUDIO, g_muteOtherAudio        ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hDlg, IDC_DETECT_BM,      g_detectBadManner       ? BST_CHECKED : BST_UNCHECKED);
         if (!g_isKorean) {
             SetWindowTextW(hDlg, L"Settings");
             SetDlgItemTextW(hDlg, IDC_SWAP_KEY,        L"Use Space bar as Control key");
@@ -2899,6 +3045,8 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
             SetDlgItemTextW(hDlg, IDC_AUTO_FETCH_CHAT,  L"Auto-load replay chat on game start");
             SetDlgItemTextW(hDlg, IDC_WHISPER_REPLY,    L"Shift+Enter: Quick reply to last whisper");
             SetDlgItemTextW(hDlg, IDC_FAST_JOIN,        L"Quick join public games");
+            SetDlgItemTextW(hDlg, IDC_MUTE_OTHER_AUDIO, L"Pause key: Mute other audio");
+            SetDlgItemTextW(hDlg, IDC_DETECT_BM,       L"Detect bad manner chat in replays");
             SetDlgItemTextW(hDlg, IDC_STATIC,          L"You can change these settings anytime by right-clicking the system tray icon.");
         }
         return (INT_PTR)TRUE;
@@ -2910,6 +3058,8 @@ INT_PTR CALLBACK SettingDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
             g_autoFetchChatOnGameStart   = IsDlgButtonChecked(hDlg, IDC_AUTO_FETCH_CHAT) == BST_CHECKED;
             g_whisperReply               = IsDlgButtonChecked(hDlg, IDC_WHISPER_REPLY)   == BST_CHECKED;
             g_fastJoin              = IsDlgButtonChecked(hDlg, IDC_FAST_JOIN)       == BST_CHECKED;
+            g_muteOtherAudio        = IsDlgButtonChecked(hDlg, IDC_MUTE_OTHER_AUDIO) == BST_CHECKED;
+            g_detectBadManner       = IsDlgButtonChecked(hDlg, IDC_DETECT_BM)         == BST_CHECKED;
             SaveSettings(); EndDialog(hDlg, IDOK); return (INT_PTR)TRUE;
         } else if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return (INT_PTR)TRUE; }
     }

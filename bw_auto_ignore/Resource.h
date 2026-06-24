@@ -23,6 +23,8 @@
 #define IDC_WHISPER_REPLY          1009
 #define IDC_AUTO_SHOW_STATS        1010
 #define IDC_AUTO_FETCH_CHAT        1011
+#define IDC_MUTE_OTHER_AUDIO       1012
+#define IDC_DETECT_BM              1013
 
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
